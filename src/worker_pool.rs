@@ -7,7 +7,7 @@ use notify_future::NotifyFuture;
 use tokio::runtime::Runtime;
 
 #[async_trait::async_trait]
-pub trait Worker {
+pub trait Worker: Send + Sync + 'static {
     fn is_work(&self) -> bool;
 }
 
@@ -48,7 +48,7 @@ impl<W: Worker, F: WorkerFactory<W>> Drop for WorkerGuard<W, F> {
 }
 
 #[async_trait::async_trait]
-pub trait WorkerFactory<W: Worker> {
+pub trait WorkerFactory<W: Worker>: Send + Sync + 'static {
     async fn create(&self) -> W;
 }
 
@@ -58,7 +58,7 @@ struct WorkerPoolState<W: Worker, F: WorkerFactory<W>> {
     waiting_list: VecDeque<NotifyFuture<WorkerGuard<W, F>>>,
 }
 pub struct WorkerPool<W: Worker, F: WorkerFactory<W>> {
-    factory: F,
+    factory: Arc<F>,
     max_count: u16,
     state: Mutex<WorkerPoolState<W, F>>,
 }
@@ -67,7 +67,7 @@ pub type WorkerPoolRef<W, F> = Arc<WorkerPool<W, F>>;
 impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
     pub fn new(max_count: u16, factory: F) -> WorkerPoolRef<W, F> {
         Arc::new(WorkerPool {
-            factory,
+            factory: Arc::new(factory),
             max_count,
             state: Mutex::new(WorkerPoolState {
                 current_count: 0,
@@ -122,8 +122,12 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
             let future = state.waiting_list.pop_front();
             if let Some(future) = future {
                 let rt = Runtime::new().unwrap();
-                let work = rt.block_on(self.factory.create());
-                future.set_complete(WorkerGuard::new(work, self.clone()));
+                let factory = self.factory.clone();
+                let this = self.clone();
+                rt.spawn(async move {
+                    let work = factory.create().await;
+                    future.set_complete(WorkerGuard::new(work, this));
+                });
             } else {
                 state.current_count -= 1;
             }

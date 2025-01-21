@@ -5,6 +5,16 @@ use std::thread::sleep;
 use std::time::Duration;
 use notify_future::NotifyFuture;
 use tokio::runtime::Runtime;
+pub use sfo_result::err as pool_err;
+pub use sfo_result::into_err as into_pool_err;
+
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub enum PoolErrorCode {
+    #[default]
+    Failed,
+}
+pub type PoolError = sfo_result::Error<PoolErrorCode>;
+pub type PoolResult<T> = sfo_result::Result<T, PoolErrorCode>;
 
 #[async_trait::async_trait]
 pub trait Worker: Send + Sync + 'static {
@@ -49,13 +59,13 @@ impl<W: Worker, F: WorkerFactory<W>> Drop for WorkerGuard<W, F> {
 
 #[async_trait::async_trait]
 pub trait WorkerFactory<W: Worker>: Send + Sync + 'static {
-    async fn create(&self) -> W;
+    async fn create(&self) -> PoolResult<W>;
 }
 
 struct WorkerPoolState<W: Worker, F: WorkerFactory<W>> {
     current_count: u16,
     worker_list: VecDeque<W>,
-    waiting_list: VecDeque<NotifyFuture<WorkerGuard<W, F>>>,
+    waiting_list: VecDeque<NotifyFuture<PoolResult<WorkerGuard<W, F>>>>,
 }
 pub struct WorkerPool<W: Worker, F: WorkerFactory<W>> {
     factory: Arc<F>,
@@ -77,7 +87,7 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         })
     }
 
-    pub async fn get_worker(self: &WorkerPoolRef<W, F>) -> WorkerGuard<W, F> {
+    pub async fn get_worker(self: &WorkerPoolRef<W, F>) -> PoolResult<WorkerGuard<W, F>> {
         let wait = {
             let mut state = self.state.lock().unwrap();
 
@@ -87,7 +97,7 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                     state.current_count -= 1;
                     continue;
                 }
-                return WorkerGuard::new(worker, self.clone());
+                return Ok(WorkerGuard::new(worker, self.clone()));
             }
 
             if state.current_count < self.max_count {
@@ -103,8 +113,8 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         if let Some(wait) = wait {
             wait.await
         } else {
-            let worker = self.factory.create().await;
-            WorkerGuard::new(worker, self.clone())
+            let worker = self.factory.create().await?;
+            Ok(WorkerGuard::new(worker, self.clone()))
         }
     }
 
@@ -113,7 +123,7 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
             let mut state = self.state.lock().unwrap();
             let future = state.waiting_list.pop_front();
             if let Some(future) = future {
-                future.set_complete(WorkerGuard::new(work, self.clone()));
+                future.set_complete(Ok(WorkerGuard::new(work, self.clone())));
             } else {
                 state.worker_list.push_back(work);
             }
@@ -125,8 +135,14 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                 let factory = self.factory.clone();
                 let this = self.clone();
                 rt.spawn(async move {
-                    let work = factory.create().await;
-                    future.set_complete(WorkerGuard::new(work, this));
+                    match factory.create().await {
+                        Ok(worker) => {
+                            future.set_complete(Ok(WorkerGuard::new(worker, this)));
+                        }
+                        Err(err) => {
+                            future.set_complete(Err(err));
+                        }
+                    }
                 });
             } else {
                 state.current_count -= 1;
@@ -152,8 +168,8 @@ fn test_pool() {
 
     #[async_trait::async_trait]
     impl WorkerFactory<TestWorker> for TestWorkerFactory {
-        async fn create(&self) -> TestWorker {
-            TestWorker { work: true }
+        async fn create(&self) -> PoolResult<TestWorker> {
+            Ok(TestWorker { work: true })
         }
     }
 

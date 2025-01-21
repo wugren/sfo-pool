@@ -123,12 +123,19 @@ checksum = "719b953e2095829ee67db738b3bfa9fa368c94900df327b3f07fe6e794d2fe1f"
 
 [[package]]
 name = "sfo-pool"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "notify-future",
+ "sfo-result",
  "tokio",
 ]
+
+[[package]]
+name = "sfo-result"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b313b781722fec95d117520f0b699872ec40096a1eacf5f5c25caed1a1382841"
 
 [[package]]
 name = "syn"

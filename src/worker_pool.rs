@@ -113,7 +113,14 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         if let Some(wait) = wait {
             wait.await
         } else {
-            let worker = self.factory.create().await?;
+            let worker = match self.factory.create().await {
+                Ok(worker) => worker,
+                Err(err) => {
+                    let mut state = self.state.lock().unwrap();
+                    state.current_count -= 1;
+                    return Err(err)
+                },
+            };
             Ok(WorkerGuard::new(worker, self.clone()))
         }
     }
@@ -140,6 +147,8 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                             future.set_complete(Ok(WorkerGuard::new(worker, this)));
                         }
                         Err(err) => {
+                            let mut state = this.state.lock().unwrap();
+                            state.current_count -= 1;
                             future.set_complete(Err(err));
                         }
                     }

@@ -20,12 +20,12 @@ pub trait ClassifiedWorker<C: WorkerClassification>: Send + Sync + 'static {
     fn classification(&self) -> C;
 }
 
-pub struct ClassifiedWorkerGuard<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> {
+pub struct ClassifiedWorkerGuard<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> {
     pool_ref: ClassifiedWorkerPoolRef<C, W, F>,
     worker: Option<W>
 }
 
-impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> ClassifiedWorkerGuard<C, W, F> {
+impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> ClassifiedWorkerGuard<C, W, F> {
     fn new(worker: W, pool_ref: ClassifiedWorkerPoolRef<C, W, F>) -> Self {
         ClassifiedWorkerGuard {
             pool_ref,
@@ -34,7 +34,7 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorke
     }
 }
 
-impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> Deref for ClassifiedWorkerGuard<C, W, F> {
+impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> Deref for ClassifiedWorkerGuard<C, W, F> {
     type Target = W;
 
     fn deref(&self) -> &Self::Target {
@@ -42,13 +42,13 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorke
     }
 }
 
-impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> DerefMut for ClassifiedWorkerGuard<C, W, F> {
+impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> DerefMut for ClassifiedWorkerGuard<C, W, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.worker.as_mut().unwrap()
     }
 }
 
-impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> Drop for ClassifiedWorkerGuard<C, W, F> {
+impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> Drop for ClassifiedWorkerGuard<C, W, F> {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
             self.pool_ref.release(worker);
@@ -57,22 +57,22 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorke
 }
 
 #[async_trait::async_trait]
-pub trait ClassifiedOptionalWorkerFactory<C: WorkerClassification, W: ClassifiedWorker<C>>: Send + Sync + 'static {
+pub trait ClassifiedWorkerFactory<C: WorkerClassification, W: ClassifiedWorker<C>>: Send + Sync + 'static {
     async fn create(&self, c: Option<C>) -> PoolResult<W>;
 }
 
-struct WaitingItem<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> {
+struct WaitingItem<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> {
     future: NotifyFuture<PoolResult<ClassifiedWorkerGuard<C, W, F>>>,
     condition: Option<C>,
 }
-struct WorkerPoolState<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> {
+struct WorkerPoolState<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> {
     current_count: u16,
     classified_count_map: HashMap<C, u16>,
     worker_list: Vec<W>,
     waiting_list: Vec<WaitingItem<C, W, F>>,
 }
 
-impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> WorkerPoolState<C, W, F> {
+impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> WorkerPoolState<C, W, F> {
     fn inc_classified_count(&mut self, c: C) {
         let count = self.classified_count_map.entry(c).or_insert(0);
         *count += 1;
@@ -88,14 +88,14 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorke
     }
 }
 
-pub struct ClassifiedWorkerPool<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> {
+pub struct ClassifiedWorkerPool<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> {
     factory: Arc<F>,
     max_count: u16,
     state: Mutex<WorkerPoolState<C, W, F>>,
 }
 pub type ClassifiedWorkerPoolRef<C, W, F> = Arc<ClassifiedWorkerPool<C, W, F>>;
 
-impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedOptionalWorkerFactory<C, W>> ClassifiedWorkerPool<C, W, F> {
+impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>> ClassifiedWorkerPool<C, W, F> {
     pub fn new(max_count: u16, factory: F) -> ClassifiedWorkerPoolRef<C, W, F> {
         Arc::new(ClassifiedWorkerPool {
             factory: Arc::new(factory),
@@ -300,7 +300,7 @@ async fn test_pool() {
     struct TestWorkerFactory;
 
     #[async_trait::async_trait]
-    impl ClassifiedOptionalWorkerFactory<TestWorkerClassification, TestWorker> for TestWorkerFactory {
+    impl ClassifiedWorkerFactory<TestWorkerClassification, TestWorker> for TestWorkerFactory {
         async fn create(&self, classification: Option<TestWorkerClassification>) -> PoolResult<TestWorker> {
             if let Some(classification) = classification {
                 Ok(TestWorker { work: true, classification })

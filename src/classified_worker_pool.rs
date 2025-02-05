@@ -3,14 +3,7 @@ use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use notify_future::NotifyFuture;
-
-#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
-pub enum PoolErrorCode {
-    #[default]
-    Failed,
-}
-pub type PoolError = sfo_result::Error<PoolErrorCode>;
-pub type PoolResult<T> = sfo_result::Result<T, PoolErrorCode>;
+use crate::PoolResult;
 
 pub trait WorkerClassification: Send + Sync + 'static + Clone + Hash + Eq + PartialEq {
 

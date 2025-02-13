@@ -5,16 +5,16 @@ use std::sync::{Arc, Mutex};
 use notify_future::NotifyFuture;
 use crate::PoolResult;
 
-pub trait WorkerClassification: Send + Sync + 'static + Clone + Hash + Eq + PartialEq {
+pub trait WorkerClassification: Send + 'static + Clone + Hash + Eq + PartialEq {
 
 }
 
-impl<T: Send + Sync + 'static + Clone + Hash + Eq + PartialEq> WorkerClassification for T {
+impl<T: Send + 'static + Clone + Hash + Eq + PartialEq> WorkerClassification for T {
 
 }
 
 #[async_trait::async_trait]
-pub trait ClassifiedWorker<C: WorkerClassification>: Send + Sync + 'static {
+pub trait ClassifiedWorker<C: WorkerClassification>: Send + 'static {
     fn is_work(&self) -> bool;
     fn is_valid(&self, c: C) -> bool;
     fn classification(&self) -> C;

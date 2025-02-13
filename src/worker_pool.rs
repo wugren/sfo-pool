@@ -17,7 +17,7 @@ pub type PoolError = sfo_result::Error<PoolErrorCode>;
 pub type PoolResult<T> = sfo_result::Result<T, PoolErrorCode>;
 
 #[async_trait::async_trait]
-pub trait Worker: Send + Sync + 'static {
+pub trait Worker: Send + 'static {
     fn is_work(&self) -> bool;
 }
 

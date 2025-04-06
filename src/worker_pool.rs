@@ -3,7 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
-use notify_future::NotifyFuture;
+use notify_future::{Notify};
 use tokio::runtime::Runtime;
 pub use sfo_result::err as pool_err;
 pub use sfo_result::into_err as into_pool_err;
@@ -65,7 +65,8 @@ pub trait WorkerFactory<W: Worker>: Send + Sync + 'static {
 struct WorkerPoolState<W: Worker, F: WorkerFactory<W>> {
     current_count: u16,
     worker_list: VecDeque<W>,
-    waiting_list: VecDeque<NotifyFuture<PoolResult<WorkerGuard<W, F>>>>,
+    waiting_list: VecDeque<Notify<PoolResult<WorkerGuard<W, F>>>>,
+    clear_notify: Option<Notify<()>>,
 }
 pub struct WorkerPool<W: Worker, F: WorkerFactory<W>> {
     factory: Arc<F>,
@@ -83,6 +84,7 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                 current_count: 0,
                 worker_list: VecDeque::with_capacity(max_count as usize),
                 waiting_list: VecDeque::new(),
+                clear_notify: None,
             }),
         })
     }
@@ -90,6 +92,9 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
     pub async fn get_worker(self: &WorkerPoolRef<W, F>) -> PoolResult<WorkerGuard<W, F>> {
         let wait = {
             let mut state = self.state.lock().unwrap();
+            if state.clear_notify.is_some() {
+                return Err(PoolError::new(PoolErrorCode::Failed, "pool is clearing".to_string()));
+            }
 
             while state.worker_list.len() > 0 {
                 let worker = state.worker_list.pop_front().unwrap();
@@ -104,9 +109,9 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                 state.current_count += 1;
                 None
             } else {
-                let future = NotifyFuture::new();
-                state.waiting_list.push_back(future.clone());
-                Some(future)
+                let (notify, waiter) = Notify::new();
+                state.waiting_list.push_back(notify);
+                Some(waiter)
             }
         };
 
@@ -118,6 +123,9 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                 Err(err) => {
                     let mut state = self.state.lock().unwrap();
                     state.current_count -= 1;
+                    if state.current_count == 0 && state.clear_notify.is_some() {
+                        state.clear_notify.take().unwrap().notify(());
+                    }
                     return Err(err)
                 },
             };
@@ -125,12 +133,50 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         }
     }
 
+    pub async fn clear_all_worker(&self) {
+        let waiter = {
+            let mut state = self.state.lock().unwrap();
+            let cur_worker_count = state.worker_list.len();
+            state.worker_list.clear();
+            state.current_count -= cur_worker_count as u16;
+
+            for waiting in state.waiting_list.drain(..) {
+                waiting.notify(Err(PoolError::new(PoolErrorCode::Failed, "pool cleared".to_string())));
+            }
+
+            if state.current_count == 0 {
+                return;
+            }
+
+            let (notify, waiter) = Notify::new();
+            state.clear_notify = Some(notify);
+            waiter
+        };
+        waiter.await;
+        {
+            let mut state = self.state.lock().unwrap();
+            for waiting in state.waiting_list.drain(..) {
+                waiting.notify(Err(PoolError::new(PoolErrorCode::Failed, "pool cleared".to_string())));
+            }
+        }
+    }
+
     fn release(self: &WorkerPoolRef<W, F>, work: W) {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.clear_notify.is_some() {
+                state.current_count -= 1;
+                if state.current_count == 0 {
+                    state.clear_notify.take().unwrap().notify(());
+                }
+                return;
+            }
+        }
         if work.is_work() {
             let mut state = self.state.lock().unwrap();
             let future = state.waiting_list.pop_front();
             if let Some(future) = future {
-                future.set_complete(Ok(WorkerGuard::new(work, self.clone())));
+                future.notify(Ok(WorkerGuard::new(work, self.clone())));
             } else {
                 state.worker_list.push_back(work);
             }
@@ -138,23 +184,29 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
             let mut state = self.state.lock().unwrap();
             let future = state.waiting_list.pop_front();
             if let Some(future) = future {
-                let rt = Runtime::new().unwrap();
                 let factory = self.factory.clone();
                 let this = self.clone();
-                rt.spawn(async move {
+                tokio::spawn(async move {
                     match factory.create().await {
                         Ok(worker) => {
-                            future.set_complete(Ok(WorkerGuard::new(worker, this)));
+                            future.notify(Ok(WorkerGuard::new(worker, this)));
                         }
                         Err(err) => {
                             let mut state = this.state.lock().unwrap();
                             state.current_count -= 1;
-                            future.set_complete(Err(err));
+                            future.notify(Err(err));
+
+                            if state.current_count == 0 && state.clear_notify.is_some() {
+                                state.clear_notify.take().unwrap().notify(());
+                            }
                         }
                     }
                 });
             } else {
                 state.current_count -= 1;
+                if state.current_count == 0 && state.clear_notify.is_some() {
+                    state.clear_notify.take().unwrap().notify(());
+                }
             }
         }
     }
@@ -205,6 +257,39 @@ fn test_pool() {
         let duration = end.duration_since(start);
         println!("duration {}", duration.as_millis());
         assert!(duration.as_millis() > 2000);
+    });
+
+    sleep(Duration::from_secs(10));
+
+    let pool_ref = pool.clone();
+    rt.spawn(async move {
+        let _worker = pool_ref.get_worker().await;
+        let _worker1 = pool_ref.get_worker().await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let pool_ref = pool.clone();
+    rt.spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let worker = pool_ref.get_worker().await;
+        assert!(worker.is_err());
+    });
+
+    let pool_ref = pool.clone();
+    rt.spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let worker = pool_ref.get_worker().await;
+        assert!(worker.is_err());
+    });
+
+    let pool_ref = pool.clone();
+    rt.spawn(async move {
+        let start = std::time::Instant::now();
+        pool_ref.clear_all_worker().await;
+        let end = std::time::Instant::now();
+        let duration = end.duration_since(start);
+        println!("duration1 {}", duration.as_millis());
+        assert!(duration.as_millis() > 4000);
     });
 
     sleep(Duration::from_secs(10));

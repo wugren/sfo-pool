@@ -79,6 +79,45 @@ impl<W: Worker, F: WorkerFactory<W>> Drop for WorkerGuard<W, F> {
     }
 }
 
+struct WorkerReservation<W: Worker, F: WorkerFactory<W>> {
+    pool_ref: WorkerPoolRef<W, F>,
+    active: bool,
+}
+
+impl<W: Worker, F: WorkerFactory<W>> WorkerReservation<W, F> {
+    fn new(pool_ref: WorkerPoolRef<W, F>) -> Self {
+        Self {
+            pool_ref,
+            active: true,
+        }
+    }
+
+    fn complete(mut self) -> bool {
+        let (clearing, clear_waiters) = {
+            let mut state = self.pool_ref.state.lock().unwrap();
+            if state.clearing {
+                state.current_count -= 1;
+                (true, state.take_clear_waiters_if_done())
+            } else {
+                (false, Vec::new())
+            }
+        };
+        self.active = false;
+        for waiter in clear_waiters {
+            waiter.notify(());
+        }
+        clearing
+    }
+}
+
+impl<W: Worker, F: WorkerFactory<W>> Drop for WorkerReservation<W, F> {
+    fn drop(&mut self) {
+        if self.active {
+            self.pool_ref.rollback_reservation();
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait WorkerFactory<W: Worker>: Send + Sync + 'static {
     async fn create(&self) -> PoolResult<W>;
@@ -158,14 +197,14 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         })
     }
 
-    fn remove_expired_idle_workers(
+    fn take_expired_idle_workers(
         state: &mut WorkerPoolState<W, F>,
         idle_timeout: Option<Duration>,
-    ) -> u16 {
+    ) -> Vec<W> {
         let Some(idle_timeout) = idle_timeout else {
-            return 0;
+            return Vec::new();
         };
-        let mut removed_count = 0;
+        let mut removed_workers = Vec::new();
         let now = Instant::now();
         while state
             .worker_list
@@ -173,24 +212,26 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
             .map(|idle_worker| now.duration_since(idle_worker.idle_since) >= idle_timeout)
             .unwrap_or(false)
         {
-            state.worker_list.pop_front();
+            let idle_worker = state.worker_list.pop_front().unwrap();
             state.current_count -= 1;
-            removed_count += 1;
+            removed_workers.push(idle_worker.worker);
         }
-        removed_count
+        removed_workers
     }
 
     pub fn cleanup_idle_worker(&self) -> u16 {
-        let (removed_count, clear_waiters) = {
+        let (removed_workers, clear_waiters) = {
             let mut state = self.state.lock().unwrap();
-            let removed_count =
-                Self::remove_expired_idle_workers(&mut state, self.config.idle_timeout);
+            let removed_workers =
+                Self::take_expired_idle_workers(&mut state, self.config.idle_timeout);
             let clear_waiters = state.take_clear_waiters_if_done();
-            (removed_count, clear_waiters)
+            (removed_workers, clear_waiters)
         };
         for waiter in clear_waiters {
             waiter.notify(());
         }
+        let removed_count = removed_workers.len() as u16;
+        drop(removed_workers);
         removed_count
     }
 
@@ -200,32 +241,46 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                 return Err(pool_invalid_config_error("pool max_count is zero"));
             }
 
-            let wait = {
+            let (worker, wait, should_create, removed_workers) = {
                 let mut state = self.state.lock().unwrap();
                 if state.clearing {
                     return Err(pool_clearing_error());
                 }
 
-                Self::remove_expired_idle_workers(&mut state, self.config.idle_timeout);
+                let mut removed_workers =
+                    Self::take_expired_idle_workers(&mut state, self.config.idle_timeout);
 
-                while let Some(idle_worker) = state.worker_list.pop_back() {
+                let worker = loop {
+                    let Some(idle_worker) = state.worker_list.pop_back() else {
+                        break None;
+                    };
                     let worker = idle_worker.worker;
                     if !worker.is_work() {
                         state.current_count -= 1;
+                        removed_workers.push(worker);
                         continue;
                     }
-                    return Ok(WorkerGuard::new(worker, self.clone()));
-                }
+                    break Some(worker);
+                };
 
-                if state.current_count < self.max_count {
+                if worker.is_some() {
+                    (worker, None, false, removed_workers)
+                } else if state.current_count < self.max_count {
                     state.current_count += 1;
-                    None
+                    (None, None, true, removed_workers)
                 } else {
                     let (notify, waiter) = Notify::new();
                     state.waiting_list.push_back(notify);
-                    Some(waiter)
+                    (None, Some(waiter), false, removed_workers)
                 }
             };
+
+            let reservation = should_create.then(|| WorkerReservation::new(self.clone()));
+            drop(removed_workers);
+
+            if let Some(worker) = worker {
+                return Ok(WorkerGuard::new(worker, self.clone()));
+            }
 
             if let Some(wait) = wait {
                 match wait.await {
@@ -235,36 +290,12 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                 }
             }
 
+            let reservation = reservation.unwrap();
             let worker = match self.factory.create().await {
                 Ok(worker) => worker,
-                Err(err) => {
-                    let (retry_waiters, clear_waiters) = {
-                        let mut state = self.state.lock().unwrap();
-                        state.current_count -= 1;
-                        let retry_waiters = state.drain_waiters();
-                        let clear_waiters = state.take_clear_waiters_if_done();
-                        (retry_waiters, clear_waiters)
-                    };
-                    Self::notify_retry_waiters(retry_waiters);
-                    for waiter in clear_waiters {
-                        waiter.notify(());
-                    }
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
             };
-            let (clearing, clear_waiters) = {
-                let mut state = self.state.lock().unwrap();
-                if state.clearing {
-                    state.current_count -= 1;
-                    (true, state.take_clear_waiters_if_done())
-                } else {
-                    (false, Vec::new())
-                }
-            };
-            for waiter in clear_waiters {
-                waiter.notify(());
-            }
-            if clearing {
+            if reservation.complete() {
                 return Err(pool_cleared_error());
             }
             return Ok(WorkerGuard::new(worker, self.clone()));
@@ -272,23 +303,30 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
     }
 
     pub async fn clear_all_worker(&self) {
-        let (waiter, waiting_list, clear_waiters) = {
+        let (waiter, waiting_list, clear_waiters, idle_workers) = {
             let mut state = self.state.lock().unwrap();
-            if !state.clearing {
+            let idle_workers = if !state.clearing {
                 state.clearing = true;
                 let cur_worker_count = state.worker_list.len();
-                state.worker_list.clear();
+                let idle_workers = state
+                    .worker_list
+                    .drain(..)
+                    .map(|idle_worker| idle_worker.worker)
+                    .collect::<Vec<_>>();
                 state.current_count -= cur_worker_count as u16;
-            }
+                idle_workers
+            } else {
+                Vec::new()
+            };
 
             let waiting_list = state.waiting_list.drain(..).collect::<Vec<_>>();
             if state.current_count == 0 {
                 let clear_waiters = state.take_clear_waiters_if_done();
-                (None, waiting_list, clear_waiters)
+                (None, waiting_list, clear_waiters, idle_workers)
             } else {
                 let (notify, waiter) = Notify::new();
                 state.clear_waiting_list.push(notify);
-                (Some(waiter), waiting_list, Vec::new())
+                (Some(waiter), waiting_list, Vec::new(), idle_workers)
             }
         };
         for waiting in waiting_list {
@@ -297,6 +335,7 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         for waiter in clear_waiters {
             waiter.notify(());
         }
+        drop(idle_workers);
         if let Some(waiter) = waiter {
             waiter.await;
         }
@@ -305,6 +344,20 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
     fn notify_retry_waiters(waiters: Vec<Notify<WorkerWaitResult<W, F>>>) {
         for waiter in waiters {
             waiter.notify(WorkerWaitResult::Retry);
+        }
+    }
+
+    fn rollback_reservation(&self) {
+        let (retry_waiters, clear_waiters) = {
+            let mut state = self.state.lock().unwrap();
+            state.current_count -= 1;
+            let retry_waiters = state.drain_waiters();
+            let clear_waiters = state.take_clear_waiters_if_done();
+            (retry_waiters, clear_waiters)
+        };
+        Self::notify_retry_waiters(retry_waiters);
+        for waiter in clear_waiters {
+            waiter.notify(());
         }
     }
 
@@ -771,7 +824,6 @@ async fn test_idle_worker_timeout_releases_worker() {
         },
         WorkerPoolConfig {
             idle_timeout: Some(std::time::Duration::from_millis(30)),
-            ..WorkerPoolConfig::default()
         },
     );
 
@@ -823,7 +875,6 @@ async fn test_idle_worker_reused_before_timeout() {
         },
         WorkerPoolConfig {
             idle_timeout: Some(std::time::Duration::from_secs(1)),
-            ..WorkerPoolConfig::default()
         },
     );
 
@@ -875,7 +926,6 @@ async fn test_cleanup_idle_worker_can_be_triggered_externally() {
         },
         WorkerPoolConfig {
             idle_timeout: Some(std::time::Duration::from_millis(30)),
-            ..WorkerPoolConfig::default()
         },
     );
 
@@ -940,4 +990,247 @@ async fn test_get_worker_uses_most_recent_idle_worker() {
     let worker = pool.get_worker().await.unwrap();
     assert_eq!(worker.id, 1);
     assert_eq!(create_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_canceled_create_rolls_back_reservation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TestWorker;
+
+    #[async_trait::async_trait]
+    impl Worker for TestWorker {
+        fn is_work(&self) -> bool {
+            true
+        }
+    }
+
+    struct TestWorkerFactory {
+        create_started: Arc<AtomicBool>,
+        allow_create: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerFactory<TestWorker> for TestWorkerFactory {
+        async fn create(&self) -> PoolResult<TestWorker> {
+            self.create_started.store(true, Ordering::SeqCst);
+            while !self.allow_create.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            Ok(TestWorker)
+        }
+    }
+
+    let create_started = Arc::new(AtomicBool::new(false));
+    let allow_create = Arc::new(AtomicBool::new(false));
+    let pool = WorkerPool::new(
+        1,
+        TestWorkerFactory {
+            create_started: create_started.clone(),
+            allow_create: allow_create.clone(),
+        },
+    );
+
+    let pool_ref = pool.clone();
+    let create_task = tokio::spawn(async move { pool_ref.get_worker().await });
+    while !create_started.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    create_task.abort();
+    assert!(matches!(create_task.await, Err(err) if err.is_cancelled()));
+
+    allow_create.store(true, Ordering::SeqCst);
+    let worker = tokio::time::timeout(std::time::Duration::from_secs(1), pool.get_worker())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(worker);
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), pool.clear_all_worker())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_cleanup_drops_idle_worker_outside_state_lock() {
+    use std::sync::mpsc;
+
+    type DropCallback = Box<dyn FnOnce() + Send>;
+
+    struct TestWorker {
+        on_drop: Option<DropCallback>,
+    }
+
+    #[async_trait::async_trait]
+    impl Worker for TestWorker {
+        fn is_work(&self) -> bool {
+            true
+        }
+    }
+
+    impl Drop for TestWorker {
+        fn drop(&mut self) {
+            if let Some(on_drop) = self.on_drop.take() {
+                on_drop();
+            }
+        }
+    }
+
+    struct TestWorkerFactory {
+        on_drop: Arc<Mutex<Option<DropCallback>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerFactory<TestWorker> for TestWorkerFactory {
+        async fn create(&self) -> PoolResult<TestWorker> {
+            Ok(TestWorker {
+                on_drop: self.on_drop.lock().unwrap().take(),
+            })
+        }
+    }
+
+    let on_drop = Arc::new(Mutex::new(None));
+    let pool = WorkerPool::new_with_config(
+        1,
+        TestWorkerFactory {
+            on_drop: on_drop.clone(),
+        },
+        WorkerPoolConfig {
+            idle_timeout: Some(Duration::ZERO),
+        },
+    );
+    let (tx, rx) = mpsc::channel();
+    let pool_ref = pool.clone();
+    *on_drop.lock().unwrap() = Some(Box::new(move || {
+        pool_ref.cleanup_idle_worker();
+        tx.send(()).unwrap();
+    }));
+
+    let worker = pool.get_worker().await.unwrap();
+    drop(worker);
+
+    let pool_ref = pool.clone();
+    let cleanup_thread = std::thread::spawn(move || pool_ref.cleanup_idle_worker());
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(cleanup_thread.join().unwrap(), 1);
+}
+
+#[cfg(test)]
+mod affected_drop_path_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    type DropCallback = Box<dyn FnOnce() + Send>;
+
+    struct TestWorker {
+        working: Arc<AtomicBool>,
+        on_drop: Option<DropCallback>,
+    }
+
+    #[async_trait::async_trait]
+    impl Worker for TestWorker {
+        fn is_work(&self) -> bool {
+            self.working.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for TestWorker {
+        fn drop(&mut self) {
+            if let Some(on_drop) = self.on_drop.take() {
+                on_drop();
+            }
+        }
+    }
+
+    struct WorkerSpec {
+        working: Arc<AtomicBool>,
+        on_drop: Option<DropCallback>,
+    }
+
+    struct TestWorkerFactory {
+        specs: Arc<Mutex<VecDeque<WorkerSpec>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerFactory<TestWorker> for TestWorkerFactory {
+        async fn create(&self) -> PoolResult<TestWorker> {
+            let spec = self.specs.lock().unwrap().pop_front().unwrap();
+            Ok(TestWorker {
+                working: spec.working,
+                on_drop: spec.on_drop,
+            })
+        }
+    }
+
+    fn new_pool() -> (
+        WorkerPoolRef<TestWorker, TestWorkerFactory>,
+        Arc<Mutex<VecDeque<WorkerSpec>>>,
+    ) {
+        let specs = Arc::new(Mutex::new(VecDeque::new()));
+        let pool = WorkerPool::new(
+            1,
+            TestWorkerFactory {
+                specs: specs.clone(),
+            },
+        );
+        (pool, specs)
+    }
+
+    fn lock_check_spec(
+        pool: &WorkerPoolRef<TestWorker, TestWorkerFactory>,
+        working: Arc<AtomicBool>,
+    ) -> (WorkerSpec, mpsc::Receiver<bool>) {
+        let (tx, rx) = mpsc::channel();
+        let pool_ref = Arc::downgrade(pool);
+        let on_drop = Box::new(move || {
+            let pool_ref = pool_ref.upgrade().unwrap();
+            tx.send(pool_ref.state.try_lock().is_ok()).unwrap();
+        });
+        (
+            WorkerSpec {
+                working,
+                on_drop: Some(on_drop),
+            },
+            rx,
+        )
+    }
+
+    fn plain_spec() -> WorkerSpec {
+        WorkerSpec {
+            working: Arc::new(AtomicBool::new(true)),
+            on_drop: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_idle_worker_is_dropped_outside_state_lock() {
+        let (pool, specs) = new_pool();
+        let working = Arc::new(AtomicBool::new(true));
+        let (spec, drop_result) = lock_check_spec(&pool, working.clone());
+        specs.lock().unwrap().push_back(spec);
+
+        let worker = pool.get_worker().await.unwrap();
+        drop(worker);
+        working.store(false, Ordering::SeqCst);
+        specs.lock().unwrap().push_back(plain_spec());
+
+        let replacement = pool.get_worker().await.unwrap();
+        assert!(drop_result.recv_timeout(Duration::from_secs(1)).unwrap());
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn test_clear_drops_idle_worker_outside_state_lock() {
+        let (pool, specs) = new_pool();
+        let (spec, drop_result) = lock_check_spec(&pool, Arc::new(AtomicBool::new(true)));
+        specs.lock().unwrap().push_back(spec);
+
+        let worker = pool.get_worker().await.unwrap();
+        drop(worker);
+        pool.clear_all_worker().await;
+
+        assert!(drop_result.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
 }

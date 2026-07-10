@@ -29,6 +29,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-waker"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
 name = "backtrace"
 version = "0.3.74"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -78,9 +84,12 @@ dependencies = [
 
 [[package]]
 name = "notify-future"
-version = "0.2.4"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaa0ee17c9a1ef38af21088fb063a697d263efb38c6510a68abc4ceef738a062"
+checksum = "71a7c45d8187d408ef57d70da3597c19114754a2f95a544ac16b116d365ac3a3"
+dependencies = [
+ "atomic-waker",
+]
 
 [[package]]
 name = "object"

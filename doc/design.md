@@ -48,6 +48,7 @@
 - 调用方通过 `get_worker()` 或 `get_classified_worker()` 获得 guard。
 - guard 持有真实 worker。
 - guard `Drop` 时自动将 worker 归还给池。
+- 分类 guard 保留可变解引用；池会缓存 factory 创建并校验时的主分类，后续计数不依赖 worker 内部字段是否变化。
 
 这意味着库把“借出”和“归还”的生命周期绑定在 Rust 所有权模型上，避免显式 `release()` API 造成的遗漏。
 
@@ -68,7 +69,7 @@
 
 - 快路径在锁内完成状态判定
 - 慢路径在锁外执行异步创建
-- 创建失败后重新回到锁内回滚计数，并唤醒当前等待者重试
+- 创建名额由 RAII reservation guard 管理；创建失败或创建 future 被取消时自动回滚计数，并唤醒当前等待者重试
 - idle worker 释放是懒惰触发的：在获取 worker 前清理，也可以由调用方显式调用 `cleanup_idle_worker()`
 
 ### 3.3 生命周期语义
@@ -229,11 +230,12 @@ worker 在池中的状态可以抽象为：
 
 虽然接口提供了 `is_valid(c)`，看起来支持“一个 worker 服务多个分类”的能力，但当前实现实际还依赖以下假设：
 
-- 每个 worker 有一个稳定的主分类 `classification()`
+- 每个 worker 在创建并校验时确定一个稳定的池内主分类；该值独立于 worker 后续可能发生的内部变化
 - 分类计数是按这个主分类维护的
 - 分类请求创建中会先记录到 `pending_classified_count_map`，用于判断某个分类是否已经有已创建或正在创建的 worker
 - 由重试触发的新建 worker 会按等待者自己的请求条件创建：普通请求调用 `create(None)`，分类请求调用 `create(Some(c))`
 - `create(Some(c))` 当前必须返回 `classification() == c` 且对自身主分类有效的 worker
+- `ClassifiedWorkerGuard` 提供 `DerefMut`，但分类计数始终使用创建时缓存的主分类
 
 因此当前实现更接近“单主分类 worker + 可选兼容判断”的模型，而不是完全泛化的多分类能力模型。
 
@@ -326,6 +328,11 @@ sequenceDiagram
   - `create(Some(c))` 返回不匹配分类时会失败并回滚计数
   - generic factory 返回的 worker 必须对自身主分类有效
   - 被取消的等待者不会阻塞后续 retry 通知
+  - 创建 future 被取消时会自动释放预留名额，后续获取与清池不会永久等待
+  - idle worker 在状态锁释放后才执行析构，析构重入清理接口不会死锁
+  - 分类池普通创建、idle 替换创建和临时超限创建的取消路径均会回滚 reservation
+  - 通用池和分类池的超时清理、无效 idle 扫描、分类替换与清池路径均在状态锁外析构 worker
+  - 缓存主分类在 idle 清理、无效扫描、替换、直接交付、clearing、非匹配等待者替换和超限回落路径中保持计数一致
   - 分类等待者相对后续普通等待者保持队列优先级
   - idle worker 超时后会释放并允许后续重新创建
   - 未超时 idle worker 会被复用
@@ -336,7 +343,7 @@ sequenceDiagram
 
 `cargo test` 当前结果：
 
-- 30 个测试全部通过
+- 45 个测试全部通过
 - 单元测试执行耗时约 0.13 秒，不含增量编译时间
 
 ## 9. 实现评审结论

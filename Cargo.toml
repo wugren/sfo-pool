@@ -1,10 +1,11 @@
 [package]
 name = "sfo-pool"
-version = "0.2.8"
+version = "0.3.0"
 edition = "2021"
 license-file = "LICENSE"
 repository = "https://github.com/wugren/sfo-pool.git"
 description = "A work allocation pool"
+exclude = ["doc/**", "AGENTS.md"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

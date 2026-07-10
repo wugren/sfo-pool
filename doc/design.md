@@ -45,10 +45,10 @@
 
 设计上采用 RAII：
 
-- 调用方通过 `get_worker()` 或 `get_classified_worker()` 获得 guard。
+- 通用池通过 `get_worker()` 获取 guard，分类池通过 `get_worker(c)` 获取明确分类的 guard。
 - guard 持有真实 worker。
 - guard `Drop` 时自动将 worker 归还给池。
-- 分类 guard 保留可变解引用；池会缓存 factory 创建并校验时的主分类，后续计数不依赖 worker 内部字段是否变化。
+- 分类 guard 保留可变解引用；池会缓存 factory 创建并校验时的主分类。worker 归还时如果当前分类与缓存的主分类不一致，池会直接删除该 worker，避免分类计数与实际状态不一致。
 
 这意味着库把“借出”和“归还”的生命周期绑定在 Rust 所有权模型上，避免显式 `release()` API 造成的遗漏。
 
@@ -62,8 +62,8 @@
 - 一个等待队列
 - `current_count` 跟踪当前池中已创建但尚未彻底销毁的 worker 数量
 - `clear_waiting_list` 协调 `clear_all_worker()` 对借出中 worker 或创建中 worker 的等待
-- `WorkerPoolConfig` 控制通用池可选的 idle worker 释放策略
-- `ClassifiedWorkerPoolConfig` 控制分类池 idle worker 释放策略
+- `WorkerPoolConfig` 控制通用池可选的总量上限和 idle worker 释放策略
+- `ClassifiedWorkerPoolConfig` 控制分类池可选的总量目标、idle worker 释放策略和单分类 worker 数量上限
 
 因此它们的并发模型是：
 
@@ -81,7 +81,7 @@ worker 在池中的状态可以抽象为：
                          \-> 无效 -> 销毁或替换
 ```
 
-其中“无效”由业务 worker 自身通过 `is_work()` 决定，而不是由池内部探测。
+其中“无效”由业务 worker 自身通过 `is_work()` 决定。分类池还会在获取空闲 worker 和归还 worker 时校验缓存的主分类；当前分类发生变化，或者 `is_valid(primary_classification)` 返回 `false` 的 worker 会直接销毁，不进入空闲队列。
 
 ## 4. 通用 WorkerPool 设计
 
@@ -92,10 +92,12 @@ worker 在池中的状态可以抽象为：
 - `Worker::is_work(&self) -> bool`
 - `WorkerFactory::create(&self) -> PoolResult<W>`
 - `WorkerPool::new(max_count, factory)`
-- `WorkerPool::new_with_config(max_count, factory, config)`
+- `WorkerPool::new_with_config(factory, config)`
 - `WorkerPool::get_worker()`
 - `WorkerPool::cleanup_idle_worker()`
 - `WorkerPool::clear_all_worker()`
+
+`Worker` trait 方法可能在池的内部状态锁持有期间被调用，因此实现必须快速、非阻塞，并且不能重入同一个池的 API。
 
 ### 4.2 内部状态
 
@@ -125,8 +127,8 @@ worker 在池中的状态可以抽象为：
 3. 尝试从空闲队列尾部取最近使用过的 worker。
 4. 若取到的 worker 已失效，则减少 `current_count` 并继续扫描。
 5. 若存在有效空闲 worker，直接返回 guard。
-6. 若没有空闲 worker 且 `current_count < max_count`，先占用一个创建名额，再在锁外异步创建。
-7. 若已达到上限，则进入等待队列并挂起。
+6. 若没有空闲 worker，且 `max_count` 为 `None` 或 `current_count < max_count`，先占用一个创建名额，再在锁外异步创建。
+7. 若配置了有限上限且已达到上限，则进入等待队列并挂起。
 
 ### 4.4 归还 worker 流程
 
@@ -170,72 +172,67 @@ worker 在池中的状态可以抽象为：
 - `WorkerClassification`: 分类标识 trait
 - `ClassifiedWorker::is_valid(c)`: 判断 worker 是否可处理目标分类
 - `ClassifiedWorker::classification()`: 返回 worker 的自身分类
-- `ClassifiedWorkerFactory::create(Option<C>)`: 支持按分类创建 worker
-- `ClassifiedWorkerPool::new_with_config(...)`: 创建带配置的分类池
+- `ClassifiedWorkerFactory::create(C)`: 按明确分类创建 worker
+- `ClassifiedWorkerPool::new(factory, config)`: 创建分类池；配置可省略总量目标
 - `ClassifiedWorkerPool::cleanup_idle_worker()`: 显式触发 idle worker 懒惰清理
+
+`ClassifiedWorker` trait 方法可能在池的内部状态锁持有期间被调用，因此实现必须快速、非阻塞，并且不能重入同一个池的 API。
 
 ### 5.3 内部状态
 
 `ClassifiedWorkerPool` 的状态比通用池多几类分类相关结构：
 
 - `classified_count_map`: 按分类统计已创建 worker 数量
-- `pending_classified_count_map`: 按分类统计已经预留名额、但 `factory.create(Some(c))` 尚未完成的创建任务数量
-- `waiting_list`: 每个等待项都带一个 `condition: Option<C>`
+- `pending_classified_count_map`: 按分类统计已经预留名额、但 `factory.create(c)` 尚未完成的创建任务数量
+- `waiting_list`: 每个等待项都带一个明确的 `condition: C`
 - `worker_list`: 带 `idle_since` 的 idle worker 队列，头部最旧、尾部最新
 
-其中：
+已取消的等待项会在后续获取或 worker 归还时从等待队列中删除。分类池不提供无分类的 `get_worker()`，因此创建、等待和重试始终携带明确分类。
 
-- `None` 表示普通 `get_worker()` 请求
-- `Some(c)` 表示 `get_classified_worker(c)` 请求
+### 5.4 分类获取流程
 
-### 5.4 普通获取流程
-
-`get_worker()` 的行为基本和通用池一致：
-
-- 可复用任意有效空闲 worker
-- 创建时调用 `factory.create(None)`
-- 创建成功后根据 `worker.classification()` 更新分类计数
-
-### 5.5 分类获取流程
-
-`get_classified_worker(classification)` 的行为如下：
+`get_worker(classification)` 的行为如下：
 
 1. 若正在清理，直接失败。
 2. 先懒惰清理已超时的 idle worker，并同步修正分类计数。
 3. 遍历空闲列表，剔除无效 worker，并同步修正分类计数。
 4. 从剩余空闲 worker 中自尾向头查找第一个 `worker.is_valid(classification)` 的实例。
 5. 若找到，直接借出。
-6. 若未找到且 `current_count < max_count`，占用一个创建名额并创建目标分类 worker。
-7. 若已达到 `max_count` 但存在不匹配的 idle worker，优先淘汰最久未使用的不匹配 idle worker，并复用该名额创建目标分类 worker。
-8. 若已达到 `max_count` 且没有 idle worker 可淘汰：
+6. 若目标分类已达到 `max_count_per_classification`，进入带条件的等待队列。
+7. 若未达到单分类上限，且 `max_count` 为 `None` 或 `current_count < max_count`，占用一个创建名额并创建目标分类 worker。
+8. 若配置了有限 `max_count`、已达到目标且存在不匹配的 idle worker，优先淘汰最久未使用的不匹配 idle worker，并复用该名额创建目标分类 worker。
+9. 若已达到有限 `max_count` 且没有 idle worker 可淘汰：
    - 如果目标分类当前没有已创建或正在创建的 worker，则临时突破 `max_count` 创建该分类 worker；
    - 否则进入带条件的等待队列。
 
-### 5.6 归还流程
+### 5.5 归还流程
 
-归还时分两类：
+归还时分三类：
+
+- 当前分类与创建时缓存的主分类不一致，或 worker 已不能服务缓存的主分类：
+  - 直接减少总数和缓存主分类的计数并删除 worker；
+  - 若存在等待者，则唤醒等待者重试。
 
 - 有效 worker：
   - 优先交付等待队列中第一个可匹配的请求；
-  - `None` 条件的普通请求可匹配任意有效 worker；
-  - `Some(c)` 条件的分类请求通过 `worker.is_valid(c)` 判断；
-  - 如果当前 worker 不能匹配任何等待者，但存在分类等待者，则淘汰当前 worker，并唤醒当前等待队列中的所有等待者重试；
+  - 每个等待请求都通过 `worker.is_valid(c)` 判断是否匹配；
+  - 如果当前 worker 不能匹配任何等待者，但存在尚未达到单分类上限的分类等待者，则淘汰当前 worker，并唤醒当前等待队列中的所有等待者重试；
   - 如果当前 worker 是临时突破 `max_count` 后产生的多余容量，且没有等待者需要它，则直接释放，避免长期超过目标容量；
   - 其他情况下带 `idle_since` 时间戳放回空闲队列尾部。
 - 无效 worker：
   - 若存在等待者，则唤醒当前等待队列中的所有等待者重试，由等待者按自己的请求条件重新获取或创建 worker；
   - 若无等待者，则减少总数和分类计数。
 
-### 5.7 分类池当前实现的隐含假设
+### 5.6 分类池当前实现的隐含假设
 
 虽然接口提供了 `is_valid(c)`，看起来支持“一个 worker 服务多个分类”的能力，但当前实现实际还依赖以下假设：
 
-- 每个 worker 在创建并校验时确定一个稳定的池内主分类；该值独立于 worker 后续可能发生的内部变化
+- 每个 worker 在创建并校验时确定一个池内主分类；worker 在后续获取和归还校验中必须仍然报告该分类并对该分类有效，否则会被直接删除
 - 分类计数是按这个主分类维护的
 - 分类请求创建中会先记录到 `pending_classified_count_map`，用于判断某个分类是否已经有已创建或正在创建的 worker
-- 由重试触发的新建 worker 会按等待者自己的请求条件创建：普通请求调用 `create(None)`，分类请求调用 `create(Some(c))`
-- `create(Some(c))` 当前必须返回 `classification() == c` 且对自身主分类有效的 worker
-- `ClassifiedWorkerGuard` 提供 `DerefMut`，但分类计数始终使用创建时缓存的主分类
+- 由重试触发的新建 worker 会按等待者自己的请求条件调用 `create(c)`
+- `create(c)` 必须返回 `classification() == c` 且对自身主分类有效的 worker
+- `ClassifiedWorkerGuard` 提供 `DerefMut`；分类计数使用创建时缓存的主分类，归还时会校验当前分类是否仍与其一致
 
 因此当前实现更接近“单主分类 worker + 可选兼容判断”的模型，而不是完全泛化的多分类能力模型。
 
@@ -316,7 +313,7 @@ sequenceDiagram
   - 容量耗尽后的等待
   - 清池时等待请求失败
   - 清池对借出中 worker 的等待
-  - 分类请求与普通请求共存
+  - 多分类请求共存
 - 补充的回归测试：
   - `max_count == 0` 时立即返回错误
   - 并发多次 `clear_all_worker()` 不会互相挂死
@@ -324,16 +321,19 @@ sequenceDiagram
   - 分类池在满池且无目标分类 worker 时允许为该分类临时突破 `max_count`
   - 分类池在存在不匹配 idle worker 时会淘汰 idle 并创建目标分类 worker
   - 分类等待者可在不匹配 worker 归还时触发替换创建
-  - 分类创建失败后会唤醒后续等待者重新获取，普通等待者不会永久挂起
-  - `create(Some(c))` 返回不匹配分类时会失败并回滚计数
-  - generic factory 返回的 worker 必须对自身主分类有效
+  - 分类创建失败后会唤醒后续同分类等待者重新获取
+  - `create(c)` 返回不匹配分类时会失败并回滚计数
+  - factory 返回的 worker 必须对自身主分类有效
   - 被取消的等待者不会阻塞后续 retry 通知
   - 创建 future 被取消时会自动释放预留名额，后续获取与清池不会永久等待
   - idle worker 在状态锁释放后才执行析构，析构重入清理接口不会死锁
-  - 分类池普通创建、idle 替换创建和临时超限创建的取消路径均会回滚 reservation
+  - 分类池创建、idle 替换创建和临时超限创建的取消路径均会回滚 reservation
   - 通用池和分类池的超时清理、无效 idle 扫描、分类替换与清池路径均在状态锁外析构 worker
-  - 缓存主分类在 idle 清理、无效扫描、替换、直接交付、clearing、非匹配等待者替换和超限回落路径中保持计数一致
-  - 分类等待者相对后续普通等待者保持队列优先级
+  - worker 归还时分类发生变化或对缓存的主分类失效会直接删除，并唤醒分类等待者重新获取
+  - idle worker 对缓存的主分类失效后，会在后续获取扫描中被删除并释放对应分类配额
+  - 缓存主分类在 idle 清理、无效扫描、替换、clearing 和超限回落路径中保持计数一致
+  - 单分类上限会阻塞对应分类，但不会阻塞其他分类创建
+  - 同分类等待者保持队列优先级
   - idle worker 超时后会释放并允许后续重新创建
   - 未超时 idle worker 会被复用
   - 多个 idle worker 中优先复用最近使用过的 worker
@@ -343,7 +343,7 @@ sequenceDiagram
 
 `cargo test` 当前结果：
 
-- 45 个测试全部通过
+- 54 个测试全部通过
 - 单元测试执行耗时约 0.13 秒，不含增量编译时间
 
 ## 9. 实现评审结论
@@ -360,7 +360,7 @@ sequenceDiagram
 
 ### 9.1 中：分类兼容模型仍然偏向“单主分类”
 
-虽然接口提供了 `is_valid(c)`，但状态统计仍以 `classification()` 为主分类单位维护，并且当前实现已经要求 `create(Some(c))` 必须返回 `classification() == c` 的 worker。因此当前实现更适合：
+虽然接口提供了 `is_valid(c)`，但状态统计仍以 `classification()` 为主分类单位维护，并且当前实现要求 `create(c)` 必须返回 `classification() == c` 的 worker。因此当前实现更适合：
 
 - 一个 worker 绑定一个主分类
 - `is_valid()` 作为兼容性扩展，而不是完全泛化的多分类供给模型
@@ -377,7 +377,7 @@ sequenceDiagram
 
 ### 9.3 低：分类池 `max_count` 现在是目标上限
 
-分类池默认仍尽量保持 `max_count` 硬上限：分类请求满池时，会先淘汰不匹配 idle worker 来复用名额；等待中的分类请求遇到不匹配 worker 归还时，也会替换创建目标分类 worker。
+配置有限 `max_count` 时，分类池仍尽量保持该目标：分类请求满池时，会先淘汰不匹配 idle worker 来复用名额；等待中的分类请求遇到不匹配 worker 归还时，也会替换创建目标分类 worker。`max_count` 为 `None` 时不限制池总量。
 
 如果所有 worker 都处于借出或创建中，没有 idle worker 可淘汰，并且目标分类当前没有已创建或正在创建的 worker，分类请求会临时突破 `max_count` 创建该分类 worker。后续多余 worker 归还且没有等待者需要它时，会被释放以回落到目标容量。
 
@@ -388,7 +388,7 @@ sequenceDiagram
 - 当前已经有 `Clearing`、`Cleared`、`InvalidConfig` 等可区分错误码；如果调用方需要区分 factory 创建失败和配置/校验失败，可再增加类似 `CreateFailed` 或 `ValidationFailed` 的错误码。
 - 在 README 或 API 文档中显式说明 `max_count`：通用池为硬上限；分类池会为缺失分类临时突破该目标上限。
 - 明确分类模型：单分类还是多分类兼容。
-- 当前已经提供 `new_with_config(...)`、`WorkerPoolConfig::idle_timeout` 和 `ClassifiedWorkerPoolConfig::idle_timeout`；如果需要真正后台自动释放，需要再增加内部定时任务或明确要求调用方周期性调用 `cleanup_idle_worker()`。
+- 通用池提供带显式上限的 `new(max_count, factory)` 和 `new_with_config(factory, config)`；分类池提供 `new(factory, config)`。配置中的 `max_count` 默认为 `None`，表示不限制总量。如果需要真正后台自动释放，需要再增加内部定时任务或明确要求调用方周期性调用 `cleanup_idle_worker()`。
 
 ### 10.2 实现层
 
@@ -410,18 +410,24 @@ sequenceDiagram
 
 ```rust
 pub struct WorkerPoolConfig {
+    pub max_count: Option<u16>,
     pub idle_timeout: Option<Duration>,
 }
 
 pub struct ClassifiedWorkerPoolConfig {
+    pub max_count: Option<u16>,
     pub idle_timeout: Option<Duration>,
+    pub max_count_per_classification: Option<u16>,
 }
 ```
 
 其中：
 
-- `None` 表示禁用 idle worker 超时释放，保持当前行为；
-- `Some(duration)` 表示 idle worker 超过该时间后可被释放。
+- 两个配置的 `max_count` 缺省为 `None`，表示不限制池总量；`Some(0)` 是无效配置；
+- `ClassifiedWorkerPoolConfig::max_count_per_classification` 缺省为 `None`，表示不限制单个主分类的 worker 数量；
+- `Some(count)` 表示每个主分类最多保留 `count` 个已创建或正在创建的 worker，`Some(0)` 是无效配置；
+- `idle_timeout` 为 `None` 表示禁用 idle worker 超时释放，保持当前行为；
+- `idle_timeout` 为 `Some(duration)` 表示 idle worker 超过该时间后可被释放。
 
 普通池已经把空闲队列元素从 `W` 调整为带时间戳的结构：
 
@@ -464,8 +470,7 @@ idle worker 懒惰释放不能破坏这个不变量，也不能让 `clear_all_wo
 
 分类池：
 
-- 普通 `get_worker()` 应从尾部取最近归还的任意有效 worker；
-- `get_classified_worker(classification)` 应从尾部向头部查找第一个满足 `worker.is_valid(classification)` 的 worker；
+- `get_worker(classification)` 应从尾部向头部查找第一个满足 `worker.is_valid(classification)` 的 worker；
 - 分类请求满池且没有匹配 idle worker 时，先淘汰最久未使用的不匹配 idle worker，再创建目标分类 worker；
 - 若没有 idle worker 可淘汰，且目标分类当前没有已创建或正在创建的 worker，则临时突破 `max_count` 创建目标分类 worker；
 - idle 释放从头部开始释放最久未使用的 worker；

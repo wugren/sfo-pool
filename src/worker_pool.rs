@@ -35,10 +35,18 @@ pub(crate) fn pool_invalid_config_error(message: &str) -> PoolError {
 
 #[derive(Debug, Clone, Default)]
 pub struct WorkerPoolConfig {
+    /// Maximum number of workers managed by the pool.
+    ///
+    /// `None` leaves the worker count unlimited.
+    pub max_count: Option<u16>,
     pub idle_timeout: Option<Duration>,
 }
 
 #[async_trait::async_trait]
+/// A worker managed by [`WorkerPool`].
+///
+/// Methods on this trait may be called while the pool's internal state lock is held.
+/// Implementations must be non-blocking and must not re-enter APIs on the same pool.
 pub trait Worker: Send + 'static {
     fn is_work(&self) -> bool;
 }
@@ -120,6 +128,10 @@ impl<W: Worker, F: WorkerFactory<W>> Drop for WorkerReservation<W, F> {
 
 #[async_trait::async_trait]
 pub trait WorkerFactory<W: Worker>: Send + Sync + 'static {
+    /// Creates a usable worker.
+    ///
+    /// Returning `Ok` asserts that the worker is ready for use. The pool does not
+    /// call [`Worker::is_work`] before handing a newly created worker to the caller.
     async fn create(&self) -> PoolResult<W>;
 }
 
@@ -135,7 +147,7 @@ enum WorkerWaitResult<W: Worker, F: WorkerFactory<W>> {
 }
 
 struct WorkerPoolState<W: Worker, F: WorkerFactory<W>> {
-    current_count: u16,
+    current_count: usize,
     worker_list: VecDeque<IdleWorker<W>>,
     waiting_list: VecDeque<Notify<WorkerWaitResult<W, F>>>,
     clearing: bool,
@@ -167,7 +179,6 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPoolState<W, F> {
 }
 pub struct WorkerPool<W: Worker, F: WorkerFactory<W>> {
     factory: Arc<F>,
-    max_count: u16,
     config: WorkerPoolConfig,
     state: Mutex<WorkerPoolState<W, F>>,
 }
@@ -175,21 +186,22 @@ pub type WorkerPoolRef<W, F> = Arc<WorkerPool<W, F>>;
 
 impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
     pub fn new(max_count: u16, factory: F) -> WorkerPoolRef<W, F> {
-        Self::new_with_config(max_count, factory, WorkerPoolConfig::default())
+        Self::new_with_config(
+            factory,
+            WorkerPoolConfig {
+                max_count: Some(max_count),
+                ..Default::default()
+            },
+        )
     }
 
-    pub fn new_with_config(
-        max_count: u16,
-        factory: F,
-        config: WorkerPoolConfig,
-    ) -> WorkerPoolRef<W, F> {
+    pub fn new_with_config(factory: F, config: WorkerPoolConfig) -> WorkerPoolRef<W, F> {
         Arc::new(WorkerPool {
             factory: Arc::new(factory),
-            max_count,
             config,
             state: Mutex::new(WorkerPoolState {
                 current_count: 0,
-                worker_list: VecDeque::with_capacity(max_count as usize),
+                worker_list: VecDeque::new(),
                 waiting_list: VecDeque::new(),
                 clearing: false,
                 clear_waiting_list: Vec::new(),
@@ -219,7 +231,7 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         removed_workers
     }
 
-    pub fn cleanup_idle_worker(&self) -> u16 {
+    pub fn cleanup_idle_worker(&self) -> usize {
         let (removed_workers, clear_waiters) = {
             let mut state = self.state.lock().unwrap();
             let removed_workers =
@@ -230,14 +242,14 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         for waiter in clear_waiters {
             waiter.notify(());
         }
-        let removed_count = removed_workers.len() as u16;
+        let removed_count = removed_workers.len();
         drop(removed_workers);
         removed_count
     }
 
     pub async fn get_worker(self: &WorkerPoolRef<W, F>) -> PoolResult<WorkerGuard<W, F>> {
         loop {
-            if self.max_count == 0 {
+            if self.config.max_count == Some(0) {
                 return Err(pool_invalid_config_error("pool max_count is zero"));
             }
 
@@ -265,7 +277,12 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
 
                 if worker.is_some() {
                     (worker, None, false, removed_workers)
-                } else if state.current_count < self.max_count {
+                } else if self
+                    .config
+                    .max_count
+                    .map(|max_count| state.current_count < usize::from(max_count))
+                    .unwrap_or(true)
+                {
                     state.current_count += 1;
                     (None, None, true, removed_workers)
                 } else {
@@ -313,7 +330,7 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                     .drain(..)
                     .map(|idle_worker| idle_worker.worker)
                     .collect::<Vec<_>>();
-                state.current_count -= cur_worker_count as u16;
+                state.current_count -= cur_worker_count;
                 idle_workers
             } else {
                 Vec::new()
@@ -600,6 +617,36 @@ async fn test_zero_max_count_returns_error() {
     assert_eq!(worker.err().unwrap().code(), PoolErrorCode::InvalidConfig);
 }
 
+#[test]
+fn test_worker_pool_config_default_max_count() {
+    assert_eq!(WorkerPoolConfig::default().max_count, None);
+}
+
+#[tokio::test]
+async fn test_worker_pool_default_config_has_no_max_count() {
+    struct TestWorker;
+
+    impl Worker for TestWorker {
+        fn is_work(&self) -> bool {
+            true
+        }
+    }
+
+    struct TestWorkerFactory;
+
+    #[async_trait::async_trait]
+    impl WorkerFactory<TestWorker> for TestWorkerFactory {
+        async fn create(&self) -> PoolResult<TestWorker> {
+            Ok(TestWorker)
+        }
+    }
+
+    let pool = WorkerPool::new_with_config(TestWorkerFactory, Default::default());
+    let worker1 = pool.get_worker().await.unwrap();
+    let worker2 = pool.get_worker().await.unwrap();
+    drop((worker1, worker2));
+}
+
 #[tokio::test]
 async fn test_create_failure_fails_waiting_workers() {
     struct TestWorker;
@@ -818,11 +865,11 @@ async fn test_idle_worker_timeout_releases_worker() {
 
     let create_count = Arc::new(AtomicUsize::new(0));
     let pool = WorkerPool::new_with_config(
-        1,
         TestWorkerFactory {
             create_count: create_count.clone(),
         },
         WorkerPoolConfig {
+            max_count: Some(1),
             idle_timeout: Some(std::time::Duration::from_millis(30)),
         },
     );
@@ -869,11 +916,11 @@ async fn test_idle_worker_reused_before_timeout() {
 
     let create_count = Arc::new(AtomicUsize::new(0));
     let pool = WorkerPool::new_with_config(
-        1,
         TestWorkerFactory {
             create_count: create_count.clone(),
         },
         WorkerPoolConfig {
+            max_count: Some(1),
             idle_timeout: Some(std::time::Duration::from_secs(1)),
         },
     );
@@ -920,11 +967,11 @@ async fn test_cleanup_idle_worker_can_be_triggered_externally() {
 
     let create_count = Arc::new(AtomicUsize::new(0));
     let pool = WorkerPool::new_with_config(
-        1,
         TestWorkerFactory {
             create_count: create_count.clone(),
         },
         WorkerPoolConfig {
+            max_count: Some(1),
             idle_timeout: Some(std::time::Duration::from_millis(30)),
         },
     );
@@ -1091,11 +1138,11 @@ async fn test_cleanup_drops_idle_worker_outside_state_lock() {
 
     let on_drop = Arc::new(Mutex::new(None));
     let pool = WorkerPool::new_with_config(
-        1,
         TestWorkerFactory {
             on_drop: on_drop.clone(),
         },
         WorkerPoolConfig {
+            max_count: Some(1),
             idle_timeout: Some(Duration::ZERO),
         },
     );

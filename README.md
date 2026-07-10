@@ -2,7 +2,7 @@
 
 [简体中文](README_cn.md)
 
-`sfo-pool` is a Tokio-based asynchronous worker pool that provides both general-purpose and classification-aware worker pools.
+`sfo-pool` is a Tokio-based asynchronous worker pool that provides both general-purpose and keyed worker pools.
 
 It manages workers with RAII: `get_worker()` returns a guard, and the worker is automatically returned to the pool when that guard goes out of scope. No explicit `release` call is required.
 
@@ -13,7 +13,7 @@ It manages workers with RAII: `get_worker()` returns a guard, and the worker is 
 - Invalid-worker detection and eviction through `Worker::is_work()`
 - Idle timeouts and explicit idle-worker cleanup
 - Graceful pool clearing that waits for in-flight workers
-- Classification-aware worker reuse, creation, replacement, and limits
+- Keyed worker reuse, creation, replacement, and limits
 - Automatic capacity-reservation rollback when creation fails or a creation task is cancelled
 
 ## Installation
@@ -103,15 +103,15 @@ let removed_count = pool.cleanup_idle_worker();
 
 Set `max_count` to `None` for an unlimited worker count. `max_count: Some(0)` is invalid and causes worker acquisition to return `PoolErrorCode::InvalidConfig`.
 
-## Classification-aware worker pool
+## Keyed worker pool
 
-The classification-aware pool is useful when workers must be allocated by tenant, region, database, or another condition:
+The keyed pool is useful when workers must be allocated by tenant, region, database, or another condition:
 
 ```rust
 use async_trait::async_trait;
 use sfo_pool::{
-    ClassifiedWorker, ClassifiedWorkerFactory, ClassifiedWorkerPool,
-    ClassifiedWorkerPoolConfig, PoolResult,
+    KeyedWorker, KeyedWorkerFactory, KeyedWorkerPool,
+    KeyedWorkerPoolConfig, PoolResult,
 };
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -125,16 +125,16 @@ struct RegionalConnection {
     healthy: bool,
 }
 
-impl ClassifiedWorker<Region> for RegionalConnection {
+impl KeyedWorker<Region> for RegionalConnection {
     fn is_work(&self) -> bool {
         self.healthy
     }
 
-    fn is_valid(&self, region: Region) -> bool {
+    fn supports(&self, region: Region) -> bool {
         self.region == region
     }
 
-    fn classification(&self) -> Region {
+    fn primary_key(&self) -> Region {
         self.region.clone()
     }
 }
@@ -142,7 +142,7 @@ impl ClassifiedWorker<Region> for RegionalConnection {
 struct RegionalConnectionFactory;
 
 #[async_trait]
-impl ClassifiedWorkerFactory<Region, RegionalConnection> for RegionalConnectionFactory {
+impl KeyedWorkerFactory<Region, RegionalConnection> for RegionalConnectionFactory {
     async fn create(&self, region: Region) -> PoolResult<RegionalConnection> {
         Ok(RegionalConnection {
             region,
@@ -153,11 +153,11 @@ impl ClassifiedWorkerFactory<Region, RegionalConnection> for RegionalConnectionF
 
 #[tokio::main]
 async fn main() -> PoolResult<()> {
-    let pool = ClassifiedWorkerPool::new(
+    let pool = KeyedWorkerPool::new(
         RegionalConnectionFactory,
-        ClassifiedWorkerPoolConfig {
+        KeyedWorkerPoolConfig {
             max_count: Some(16),
-            max_count_per_classification: Some(4),
+            max_count_per_key: Some(4),
             idle_timeout: None,
         },
     );
@@ -169,18 +169,18 @@ async fn main() -> PoolResult<()> {
 }
 ```
 
-In a classification-aware pool, a worker created by the factory for classification `c` must satisfy both conditions:
+In a keyed pool, a worker created by the factory for `key` must satisfy both conditions:
 
-- `worker.classification() == c`
-- `worker.is_valid(worker.classification()) == true`
+- `worker.primary_key() == key`
+- `worker.supports(worker.primary_key()) == true`
 
-Otherwise, acquisition returns `PoolErrorCode::InvalidConfig`. A worker's primary classification is cached when it is created. If that primary classification changes while the worker is checked out, the worker is evicted when returned.
+Otherwise, acquisition returns `PoolErrorCode::InvalidConfig`. A worker's primary key is cached when it is created. If that primary key changes while the worker is checked out, the worker is evicted when returned.
 
-### Classification-aware capacity semantics
+### Keyed capacity semantics
 
-`ClassifiedWorkerPoolConfig::max_count` is a target rather than a strict upper bound. When the pool is full, no idle worker can be replaced, and the requested classification has no existing or pending worker, the pool may temporarily exceed this value to create a worker. Excess workers are removed after they are returned and no waiter needs them.
+`KeyedWorkerPoolConfig::max_count` is a target rather than a strict upper bound. When the pool is full, no idle worker can be replaced, and the requested key has no existing or pending worker, the pool may temporarily exceed this value to create a worker. Excess workers are removed after they are returned and no waiter needs them.
 
-`max_count_per_classification` is an independent hard limit for each classification. Once the limit is reached, new requests for that classification wait for an existing worker. Set either limit to `None` for no limit. Setting a relevant limit to `Some(0)` causes affected requests to return an invalid-configuration error.
+`max_count_per_key` is an independent hard limit for each key. Once the limit is reached, new requests for that key wait for an existing worker. Set either limit to `None` for no limit. Setting a relevant limit to `Some(0)` causes affected requests to return an invalid-configuration error.
 
 ## Clearing and errors
 
@@ -204,7 +204,7 @@ The public error types are:
 
 ## Implementation requirements
 
-`Worker::is_work()`, `ClassifiedWorker::is_work()`, `ClassifiedWorker::is_valid()`, and `ClassifiedWorker::classification()` may be called while the pool's internal state lock is held. These methods must be fast and non-blocking, and they must not re-enter APIs on the same pool.
+`Worker::is_work()`, `KeyedWorker::is_work()`, `KeyedWorker::supports()`, and `KeyedWorker::primary_key()` may be called while the pool's internal state lock is held. These methods must be fast and non-blocking, and they must not re-enter APIs on the same pool.
 
 Idle timeouts do not start a background cleanup task. Expired workers are removed before a subsequent `get_worker()` call, and applications can also call `cleanup_idle_worker()` periodically.
 

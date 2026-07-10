@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-`sfo-pool` 是一个基于 Tokio 的异步 worker 池，提供普通 worker 池和按分类分配的 worker 池。
+`sfo-pool` 是一个基于 Tokio 的异步 worker 池，提供普通 worker 池和按键分配的 worker 池。
 
 它使用 RAII 管理 worker：`get_worker()` 返回一个 guard，guard 离开作用域时会自动归还 worker，无需手动调用 `release`。
 
@@ -13,7 +13,7 @@
 - 通过 `Worker::is_work()` 检测并淘汰失效 worker
 - 支持空闲超时和手动清理空闲 worker
 - 支持等待在途 worker 归还的完整清池操作
-- 支持按分类复用、创建、替换和限制 worker
+- 支持按键复用、创建、替换和限制 worker
 - 创建失败或创建任务被取消时自动回滚容量预留
 
 ## 安装
@@ -103,15 +103,15 @@ let removed_count = pool.cleanup_idle_worker();
 
 `max_count: None` 表示不限制 worker 数量。`max_count: Some(0)` 是无效配置，获取 worker 时会返回 `PoolErrorCode::InvalidConfig`。
 
-## 分类 worker 池
+## 键 worker 池
 
-分类池适用于按租户、区域、数据库或其他条件分配 worker 的场景：
+键池适用于按租户、区域、数据库或其他条件分配 worker 的场景：
 
 ```rust
 use async_trait::async_trait;
 use sfo_pool::{
-    ClassifiedWorker, ClassifiedWorkerFactory, ClassifiedWorkerPool,
-    ClassifiedWorkerPoolConfig, PoolResult,
+    KeyedWorker, KeyedWorkerFactory, KeyedWorkerPool,
+    KeyedWorkerPoolConfig, PoolResult,
 };
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -125,16 +125,16 @@ struct RegionalConnection {
     healthy: bool,
 }
 
-impl ClassifiedWorker<Region> for RegionalConnection {
+impl KeyedWorker<Region> for RegionalConnection {
     fn is_work(&self) -> bool {
         self.healthy
     }
 
-    fn is_valid(&self, region: Region) -> bool {
+    fn supports(&self, region: Region) -> bool {
         self.region == region
     }
 
-    fn classification(&self) -> Region {
+    fn primary_key(&self) -> Region {
         self.region.clone()
     }
 }
@@ -142,7 +142,7 @@ impl ClassifiedWorker<Region> for RegionalConnection {
 struct RegionalConnectionFactory;
 
 #[async_trait]
-impl ClassifiedWorkerFactory<Region, RegionalConnection> for RegionalConnectionFactory {
+impl KeyedWorkerFactory<Region, RegionalConnection> for RegionalConnectionFactory {
     async fn create(&self, region: Region) -> PoolResult<RegionalConnection> {
         Ok(RegionalConnection {
             region,
@@ -153,11 +153,11 @@ impl ClassifiedWorkerFactory<Region, RegionalConnection> for RegionalConnectionF
 
 #[tokio::main]
 async fn main() -> PoolResult<()> {
-    let pool = ClassifiedWorkerPool::new(
+    let pool = KeyedWorkerPool::new(
         RegionalConnectionFactory,
-        ClassifiedWorkerPoolConfig {
+        KeyedWorkerPoolConfig {
             max_count: Some(16),
-            max_count_per_classification: Some(4),
+            max_count_per_key: Some(4),
             idle_timeout: None,
         },
     );
@@ -169,18 +169,18 @@ async fn main() -> PoolResult<()> {
 }
 ```
 
-分类池中，factory 为请求分类 `c` 创建的 worker 必须满足：
+键池中，factory 为请求键 `key` 创建的 worker 必须满足：
 
-- `worker.classification() == c`
-- `worker.is_valid(worker.classification()) == true`
+- `worker.primary_key() == key`
+- `worker.supports(worker.primary_key()) == true`
 
-否则获取操作会返回 `PoolErrorCode::InvalidConfig`。worker 的主分类在创建时会被缓存；如果借出期间主分类发生变化，该 worker 在归还时会被淘汰。
+否则获取操作会返回 `PoolErrorCode::InvalidConfig`。worker 的主键在创建时会被缓存；如果借出期间主键发生变化，该 worker 在归还时会被淘汰。
 
-### 分类池容量语义
+### 键池容量语义
 
-`ClassifiedWorkerPoolConfig::max_count` 是目标上限，而不是严格上限。当池已满、没有可替换的空闲 worker，并且请求的分类当前没有已创建或正在创建的 worker 时，池可以临时超过该值创建 worker。多余 worker 会在归还且没有等待者需要时被移除。
+`KeyedWorkerPoolConfig::max_count` 是目标上限，而不是严格上限。当池已满、没有可替换的空闲 worker，并且请求的键当前没有已创建或正在创建的 worker 时，池可以临时超过该值创建 worker。多余 worker 会在归还且没有等待者需要时被移除。
 
-`max_count_per_classification` 是独立的单分类硬限制；达到限制后，同分类的新请求会等待已有 worker。两个上限均可设为 `None`，表示不限制。设为 `Some(0)` 时，相关请求会返回无效配置错误。
+`max_count_per_key` 是独立的单个键硬限制；达到限制后，同键的新请求会等待已有 worker。两个上限均可设为 `None`，表示不限制。设为 `Some(0)` 时，相关请求会返回无效配置错误。
 
 ## 清理与错误
 
@@ -204,7 +204,7 @@ async fn main() -> PoolResult<()> {
 
 ## 实现约束
 
-`Worker::is_work()`、`ClassifiedWorker::is_work()`、`ClassifiedWorker::is_valid()` 和 `ClassifiedWorker::classification()` 可能在池的内部状态锁持有期间调用。它们必须快速、非阻塞，且不能重入同一个池的 API。
+`Worker::is_work()`、`KeyedWorker::is_work()`、`KeyedWorker::supports()` 和 `KeyedWorker::primary_key()` 可能在池的内部状态锁持有期间调用。它们必须快速、非阻塞，且不能重入同一个池的 API。
 
 空闲超时不会启动后台清理任务。过期 worker 会在后续 `get_worker()` 调用前被清理，应用也可以定期调用 `cleanup_idle_worker()`。
 

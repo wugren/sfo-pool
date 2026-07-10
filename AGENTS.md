@@ -4,7 +4,7 @@
 `sfo-pool` is a single-crate Rust library. The crate root is [`src/lib.rs`](F:\work\sfo-pool\src\lib.rs), which re-exports the two main modules:
 
 - [`src/worker_pool.rs`](F:\work\sfo-pool\src\worker_pool.rs): generic async worker pool primitives.
-- [`src/classified_worker_pool.rs`](F:\work\sfo-pool\src\classified_worker_pool.rs): worker pools with classification-aware allocation.
+- [`src/keyed_worker_pool.rs`](F:\work\sfo-pool\src\keyed_worker_pool.rs): worker pools with keyed allocation.
 
 Build artifacts are written to `target/` and should not be committed. Tests currently live alongside implementation in the same module files.
 
@@ -32,7 +32,7 @@ Use Rust 2021 idioms and let `rustfmt` drive formatting. Follow the existing con
 Prefer concise error paths with `PoolResult<T>` and `PoolError` instead of ad hoc result types.
 
 ## Testing Guidelines
-Add tests next to the code they exercise using `#[test]` or `#[tokio::test]`. Cover queueing, wake-up, invalid worker replacement, and classification-specific behavior when touching pool logic. Prefer focused names such as `test_clear_all_worker` over generic names.
+Add tests next to the code they exercise using `#[test]` or `#[tokio::test]`. Cover queueing, wake-up, invalid worker replacement, and key-specific behavior when touching pool logic. Prefer focused names such as `test_clear_all_worker` over generic names.
 
 Use `cargo test <name>` to run a specific test during iteration.
 

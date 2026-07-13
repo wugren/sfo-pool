@@ -7,30 +7,28 @@ use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+
+const DEFAULT_MAX_CONCURRENT_CREATION_COUNT: u16 = 20;
 
 pub trait WorkerClassification: Send + 'static + Clone + Hash + Eq + PartialEq {}
 
 impl<T: Send + 'static + Clone + Hash + Eq + PartialEq> WorkerClassification for T {}
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 /// Configuration for [`ClassifiedWorkerPool`].
 ///
-/// All limits default to `None`. Use the `with_*` methods to configure the pool.
+/// Optional limits default to `None`, and the concurrent creation limit defaults
+/// to 20. Use the `with_*` methods to configure the pool.
 pub struct ClassifiedWorkerPoolConfig {
-    /// Target maximum number of workers managed by the pool.
-    ///
-    /// `None` leaves the worker count unlimited. A finite target may be
-    /// temporarily exceeded to create a worker for a missing classification.
-    max_count: Option<u16>,
-    /// Maximum number of idle workers retained across the whole pool.
-    ///
-    /// `None` adds no separate idle limit; `Some(0)` disables idle caching.
-    max_idle_count: Option<u16>,
     idle_timeout: Option<Duration>,
+    /// Maximum number of concurrent calls to [`ClassifiedWorkerFactory::create`].
+    ///
+    /// The default is 20. Zero is invalid.
+    max_concurrent_creation_count: u16,
     /// Maximum number of workers whose primary classification is the same.
     ///
-    /// `None` leaves classification counts unlimited. This limit is independent
-    /// of the pool-wide `max_count` target.
+    /// `None` leaves classification counts unlimited.
     max_count_per_classification: Option<u16>,
     /// Maximum number of idle workers retained for each primary classification.
     ///
@@ -39,20 +37,23 @@ pub struct ClassifiedWorkerPoolConfig {
     max_idle_count_per_classification: Option<u16>,
 }
 
-impl ClassifiedWorkerPoolConfig {
-    /// Sets the pool-wide target worker count.
-    ///
-    /// `None` leaves the count unlimited. `Some(0)` is invalid.
-    pub fn with_max_count(mut self, max_count: Option<u16>) -> Self {
-        self.max_count = max_count;
-        self
+impl Default for ClassifiedWorkerPoolConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout: None,
+            max_concurrent_creation_count: DEFAULT_MAX_CONCURRENT_CREATION_COUNT,
+            max_count_per_classification: None,
+            max_idle_count_per_classification: None,
+        }
     }
+}
 
-    /// Sets the pool-wide idle-worker cache limit.
+impl ClassifiedWorkerPoolConfig {
+    /// Sets the maximum number of concurrent worker creation calls.
     ///
-    /// `None` adds no idle limit. `Some(0)` disables idle caching.
-    pub fn with_max_idle_count(mut self, max_idle_count: Option<u16>) -> Self {
-        self.max_idle_count = max_idle_count;
+    /// Zero is invalid.
+    pub fn with_max_concurrent_creation_count(mut self, max_count: u16) -> Self {
+        self.max_concurrent_creation_count = max_count;
         self
     }
 
@@ -88,8 +89,8 @@ impl ClassifiedWorkerPoolConfig {
 /// Implementations must be non-blocking and must not re-enter APIs on the same pool.
 pub trait ClassifiedWorker<C: WorkerClassification>: Send + 'static {
     fn is_work(&self) -> bool;
-    /// Returns whether this worker can currently serve the requested classification.
-    /// The pool still tracks capacity by the worker's primary `classification()`.
+    /// Returns whether this worker can currently serve its requested classification.
+    /// Explicit classified acquisition only reuses workers from that classification's bucket.
     /// A worker that is no longer valid for its cached primary classification is discarded.
     fn is_valid(&self, c: C) -> bool;
     /// Returns the worker's primary classification used for accounting and replacement.
@@ -268,7 +269,8 @@ struct WorkerPoolState<
     current_count: usize,
     classified_count_map: HashMap<C, usize>,
     pending_classified_count_map: HashMap<C, usize>,
-    worker_list: VecDeque<IdleWorker<C, W>>,
+    // Idle workers are grouped by primary classification; buckets are LRU to MRU.
+    worker_list: HashMap<C, VecDeque<IdleWorker<C, W>>>,
     waiting_list: Vec<WaitingItem<C, W, F>>,
     clearing: bool,
     clear_waiting_list: Vec<Notify<()>>,
@@ -277,6 +279,53 @@ struct WorkerPoolState<
 impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>>
     WorkerPoolState<C, W, F>
 {
+    fn push_idle_worker(&mut self, worker: W, primary_classification: C) {
+        let idle_worker = IdleWorker {
+            worker,
+            primary_classification: primary_classification.clone(),
+            idle_since: Instant::now(),
+        };
+        self.worker_list
+            .entry(primary_classification)
+            .or_default()
+            .push_back(idle_worker);
+    }
+
+    fn remove_idle_worker(&mut self, primary_classification: &C, index: usize) -> IdleWorker<C, W> {
+        let (idle_worker, remove_bucket) = {
+            let workers = self.worker_list.get_mut(primary_classification).unwrap();
+            let idle_worker = workers.remove(index).unwrap();
+            (idle_worker, workers.is_empty())
+        };
+        if remove_bucket {
+            self.worker_list.remove(primary_classification);
+        }
+        idle_worker
+    }
+
+    fn next_idle_worker_classification(&self) -> Option<C> {
+        self.worker_list.keys().next().cloned()
+    }
+
+    fn take_idle_worker_for_classification(
+        &mut self,
+        classification: &C,
+    ) -> Option<IdleWorker<C, W>> {
+        let index = self
+            .worker_list
+            .get(classification)
+            .map(VecDeque::len)
+            .and_then(|len| len.checked_sub(1))?;
+        Some(self.remove_idle_worker(classification, index))
+    }
+
+    fn drain_idle_workers(&mut self) -> Vec<IdleWorker<C, W>> {
+        std::mem::take(&mut self.worker_list)
+            .into_values()
+            .flatten()
+            .collect()
+    }
+
     fn inc_classified_count(&mut self, c: C) {
         let count = self.classified_count_map.entry(c).or_insert(0);
         *count += 1;
@@ -329,7 +378,11 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
         }
     }
 
-    fn find_matching_waiter_index_for_worker(&self, worker: &W) -> Option<usize> {
+    fn find_matching_waiter_index_for_worker(
+        &self,
+        worker: &W,
+        primary_classification: &C,
+    ) -> Option<usize> {
         self.waiting_list.iter().position(|waiting| {
             if waiting.future.is_canceled() {
                 return false;
@@ -337,7 +390,9 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
             waiting
                 .condition
                 .as_ref()
-                .map(|condition| worker.is_valid(condition.clone()))
+                .map(|condition| {
+                    condition == primary_classification && worker.is_valid(condition.clone())
+                })
                 .unwrap_or(true)
         })
     }
@@ -362,6 +417,7 @@ pub struct ClassifiedWorkerPool<
 > {
     factory: Arc<F>,
     config: ClassifiedWorkerPoolConfig,
+    creation_semaphore: Semaphore,
     state: Mutex<WorkerPoolState<C, W, F>>,
 }
 pub type ClassifiedWorkerPoolRef<C, W, F> = Arc<ClassifiedWorkerPool<C, W, F>>;
@@ -370,7 +426,10 @@ pub type ClassifiedWorkerPoolRef<C, W, F> = Arc<ClassifiedWorkerPool<C, W, F>>;
 #[test]
 fn test_classified_worker_pool_config_default_idle_limits() {
     let config = ClassifiedWorkerPoolConfig::default();
-    assert_eq!(config.max_idle_count, None);
+    assert_eq!(
+        config.max_concurrent_creation_count,
+        DEFAULT_MAX_CONCURRENT_CREATION_COUNT
+    );
     assert_eq!(config.max_idle_count_per_classification, None);
 }
 
@@ -379,16 +438,124 @@ fn test_classified_worker_pool_config_default_idle_limits() {
 fn test_classified_worker_pool_config_builder() {
     let timeout = Duration::from_secs(1);
     let config = ClassifiedWorkerPoolConfig::default()
-        .with_max_count(Some(4))
-        .with_max_idle_count(Some(3))
+        .with_max_concurrent_creation_count(3)
         .with_idle_timeout(Some(timeout))
         .with_max_count_per_classification(Some(2))
         .with_max_idle_count_per_classification(Some(1));
-    assert_eq!(config.max_count, Some(4));
-    assert_eq!(config.max_idle_count, Some(3));
     assert_eq!(config.idle_timeout, Some(timeout));
+    assert_eq!(config.max_concurrent_creation_count, 3);
     assert_eq!(config.max_count_per_classification, Some(2));
     assert_eq!(config.max_idle_count_per_classification, Some(1));
+}
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_classified_worker_pool_limits_concurrent_creation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    struct Classification;
+
+    struct TestWorker;
+
+    impl ClassifiedWorker<Classification> for TestWorker {
+        fn is_work(&self) -> bool {
+            true
+        }
+
+        fn is_valid(&self, _classification: Classification) -> bool {
+            true
+        }
+
+        fn classification(&self) -> Classification {
+            Classification
+        }
+    }
+
+    struct BlockingFactory {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        started: Arc<AtomicUsize>,
+        gate: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ClassifiedWorkerFactory<Classification, TestWorker> for BlockingFactory {
+        async fn create(&self, _classification: Option<Classification>) -> PoolResult<TestWorker> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let permit = self.gate.acquire().await.unwrap();
+            permit.forget();
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(TestWorker)
+        }
+    }
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(Semaphore::new(0));
+    let pool = ClassifiedWorkerPool::new(
+        BlockingFactory {
+            active: active.clone(),
+            max_active: max_active.clone(),
+            started: started.clone(),
+            gate: gate.clone(),
+        },
+        ClassifiedWorkerPoolConfig::default().with_max_concurrent_creation_count(2),
+    );
+
+    let pool_ref = pool.clone();
+    let task1 = tokio::spawn(async move { pool_ref.get_worker().await });
+    let pool_ref = pool.clone();
+    let task2 = tokio::spawn(async move { pool_ref.get_worker().await });
+    let pool_ref = pool.clone();
+    let task3 = tokio::spawn(async move { pool_ref.get_worker().await });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while started.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+
+    gate.add_permits(2);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while started.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    gate.add_permits(1);
+
+    let (worker1, worker2, worker3) = tokio::time::timeout(Duration::from_secs(1), async {
+        (
+            task1.await.unwrap().unwrap(),
+            task2.await.unwrap().unwrap(),
+            task3.await.unwrap().unwrap(),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    drop((worker1, worker2, worker3));
+
+    let zero_pool = ClassifiedWorkerPool::new(
+        BlockingFactory {
+            active,
+            max_active,
+            started,
+            gate,
+        },
+        ClassifiedWorkerPoolConfig::default().with_max_concurrent_creation_count(0),
+    );
+    let error = zero_pool.get_worker().await.err().unwrap();
+    assert_eq!(error.code(), crate::PoolErrorCode::InvalidConfig);
 }
 
 impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>>
@@ -399,22 +566,6 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
             .max_count_per_classification
             .map(|max_count| state.reserved_classified_count(c) >= usize::from(max_count))
             .unwrap_or(false)
-    }
-
-    fn find_replaceable_classified_waiter_index(
-        &self,
-        state: &WorkerPoolState<C, W, F>,
-    ) -> Option<usize> {
-        state.waiting_list.iter().position(|waiting| {
-            waiting
-                .condition
-                .as_ref()
-                .map(|classification| {
-                    !waiting.future.is_canceled()
-                        && !self.classification_limit_reached(state, classification)
-                })
-                .unwrap_or(false)
-        })
     }
 
     fn validate_created_worker(requested_classification: Option<&C>, worker: &W) -> PoolResult<C> {
@@ -434,28 +585,35 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
         Ok(worker_classification)
     }
 
-    /// Creates a classification-aware worker pool with explicit configuration.
-    ///
-    /// A finite `max_count` is a target rather than a strict upper bound. When the
-    /// pool is full, no idle worker can be replaced, and a requested classification
-    /// has no created or pending worker, the pool may temporarily exceed the target.
-    /// Excess workers are removed when they are returned and are not needed by a
-    /// waiter. `None` leaves the pool-wide worker count unlimited.
+    /// Creates a classification-aware worker pool with per-classification configuration.
     pub fn new(factory: F, config: ClassifiedWorkerPoolConfig) -> ClassifiedWorkerPoolRef<C, W, F> {
-        let idle_capacity = config.max_count.unwrap_or(0) as usize;
+        let creation_semaphore = Semaphore::new(usize::from(config.max_concurrent_creation_count));
         Arc::new(ClassifiedWorkerPool {
             factory: Arc::new(factory),
             config,
+            creation_semaphore,
             state: Mutex::new(WorkerPoolState {
                 current_count: 0,
                 classified_count_map: HashMap::new(),
                 pending_classified_count_map: HashMap::new(),
-                worker_list: VecDeque::with_capacity(idle_capacity),
+                worker_list: HashMap::new(),
                 waiting_list: Vec::new(),
                 clearing: false,
                 clear_waiting_list: Vec::new(),
             }),
         })
+    }
+
+    async fn create_worker(&self, classification: Option<C>) -> PoolResult<W> {
+        let _permit = self
+            .creation_semaphore
+            .acquire()
+            .await
+            .expect("creation semaphore is never closed");
+        if self.state.lock().unwrap().clearing {
+            return Err(pool_cleared_error());
+        }
+        self.factory.create(classification).await
     }
 
     fn take_expired_idle_workers(
@@ -467,16 +625,51 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
         };
         let mut removed_workers = Vec::new();
         let now = Instant::now();
-        while state
-            .worker_list
-            .front()
-            .map(|idle_worker| now.duration_since(idle_worker.idle_since) >= idle_timeout)
-            .unwrap_or(false)
-        {
-            let idle_worker = state.worker_list.pop_front().unwrap();
+        for workers in state.worker_list.values_mut() {
+            while workers
+                .front()
+                .map(|idle_worker| now.duration_since(idle_worker.idle_since) >= idle_timeout)
+                .unwrap_or(false)
+            {
+                removed_workers.push(workers.pop_front().unwrap());
+            }
+        }
+        state.worker_list.retain(|_, workers| !workers.is_empty());
+        for idle_worker in &removed_workers {
             state.current_count -= 1;
             state.dec_classified_count(idle_worker.primary_classification.clone());
-            removed_workers.push(idle_worker);
+        }
+        removed_workers
+    }
+
+    fn take_expired_idle_workers_for_classification(
+        state: &mut WorkerPoolState<C, W, F>,
+        classification: &C,
+        idle_timeout: Option<Duration>,
+    ) -> Vec<IdleWorker<C, W>> {
+        let Some(idle_timeout) = idle_timeout else {
+            return Vec::new();
+        };
+        let mut removed_workers = Vec::new();
+        let now = Instant::now();
+        let remove_bucket = if let Some(workers) = state.worker_list.get_mut(classification) {
+            while workers
+                .front()
+                .map(|idle_worker| now.duration_since(idle_worker.idle_since) >= idle_timeout)
+                .unwrap_or(false)
+            {
+                removed_workers.push(workers.pop_front().unwrap());
+            }
+            workers.is_empty()
+        } else {
+            false
+        };
+        if remove_bucket {
+            state.worker_list.remove(classification);
+        }
+        for idle_worker in &removed_workers {
+            state.current_count -= 1;
+            state.dec_classified_count(idle_worker.primary_classification.clone());
         }
         removed_workers
     }
@@ -502,8 +695,10 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
     ) -> PoolResult<ClassifiedWorkerGuard<C, W, F>> {
         let mut blocked_classification = None;
         loop {
-            if self.config.max_count == Some(0) {
-                return Err(pool_invalid_config_error("pool max_count is zero"));
+            if self.config.max_concurrent_creation_count == 0 {
+                return Err(pool_invalid_config_error(
+                    "pool max_concurrent_creation_count is zero",
+                ));
             }
             if self.config.max_count_per_classification == Some(0) {
                 return Err(pool_invalid_config_error(
@@ -518,14 +713,30 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
                 }
                 state.remove_canceled_waiters();
 
-                let mut removed_workers =
-                    Self::take_expired_idle_workers(&mut state, self.config.idle_timeout);
+                let mut removed_workers = Vec::new();
 
                 let worker = loop {
-                    let Some(idle_worker) = state.worker_list.pop_back() else {
+                    let Some(primary_classification) = state.next_idle_worker_classification()
+                    else {
                         break None;
                     };
-                    if !idle_worker.worker.is_work()
+                    removed_workers.extend(Self::take_expired_idle_workers_for_classification(
+                        &mut state,
+                        &primary_classification,
+                        self.config.idle_timeout,
+                    ));
+                    let Some(idle_worker) =
+                        state.take_idle_worker_for_classification(&primary_classification)
+                    else {
+                        continue;
+                    };
+                    let expired = self
+                        .config
+                        .idle_timeout
+                        .map(|idle_timeout| idle_worker.idle_since.elapsed() >= idle_timeout)
+                        .unwrap_or(false);
+                    if expired
+                        || !idle_worker.worker.is_work()
                         || idle_worker.worker.classification() != idle_worker.primary_classification
                         || !idle_worker
                             .worker
@@ -552,21 +763,9 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
                         condition: None,
                     });
                     (None, Some(waiter), false, removed_workers)
-                } else if self
-                    .config
-                    .max_count
-                    .map(|max_count| state.current_count < usize::from(max_count))
-                    .unwrap_or(true)
-                {
+                } else {
                     state.current_count += 1;
                     (None, None, true, removed_workers)
-                } else {
-                    let (notify, waiter) = Notify::new();
-                    state.waiting_list.push(WaitingItem {
-                        future: notify,
-                        condition: None,
-                    });
-                    (None, Some(waiter), false, removed_workers)
                 }
             };
 
@@ -591,7 +790,7 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
             }
 
             let reservation = reservation.unwrap();
-            let (worker, primary_classification) = match self.factory.create(None).await {
+            let (worker, primary_classification) = match self.create_worker(None).await {
                 Ok(worker) => {
                     let primary_classification = Self::validate_created_worker(None, &worker)?;
                     (worker, primary_classification)
@@ -620,8 +819,10 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
         classification: C,
     ) -> PoolResult<ClassifiedWorkerGuard<C, W, F>> {
         loop {
-            if self.config.max_count == Some(0) {
-                return Err(pool_invalid_config_error("pool max_count is zero"));
+            if self.config.max_concurrent_creation_count == 0 {
+                return Err(pool_invalid_config_error(
+                    "pool max_concurrent_creation_count is zero",
+                ));
             }
             if self.config.max_count_per_classification == Some(0) {
                 return Err(pool_invalid_config_error(
@@ -636,34 +837,37 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
                 }
                 state.remove_canceled_waiters();
 
-                let mut removed_workers =
-                    Self::take_expired_idle_workers(&mut state, self.config.idle_timeout);
+                let mut removed_workers = Self::take_expired_idle_workers_for_classification(
+                    &mut state,
+                    &classification,
+                    self.config.idle_timeout,
+                );
 
-                let mut valid_workers = VecDeque::with_capacity(state.worker_list.len());
-                while let Some(idle_worker) = state.worker_list.pop_front() {
-                    if idle_worker.worker.is_work()
-                        && idle_worker.worker.classification() == idle_worker.primary_classification
-                        && idle_worker
+                let worker = loop {
+                    let Some(idle_worker) =
+                        state.take_idle_worker_for_classification(&classification)
+                    else {
+                        break None;
+                    };
+                    let expired = self
+                        .config
+                        .idle_timeout
+                        .map(|idle_timeout| idle_worker.idle_since.elapsed() >= idle_timeout)
+                        .unwrap_or(false);
+                    if expired
+                        || !idle_worker.worker.is_work()
+                        || idle_worker.worker.classification() != idle_worker.primary_classification
+                        || !idle_worker
                             .worker
                             .is_valid(idle_worker.primary_classification.clone())
                     {
-                        valid_workers.push_back(idle_worker);
-                    } else {
                         state.current_count -= 1;
                         state.dec_classified_count(idle_worker.primary_classification.clone());
                         removed_workers.push(idle_worker);
+                        continue;
                     }
-                }
-                state.worker_list = valid_workers;
-
-                let worker = state
-                    .worker_list
-                    .iter()
-                    .rposition(|idle_worker| idle_worker.worker.is_valid(classification.clone()))
-                    .map(|index| {
-                        let idle_worker = state.worker_list.remove(index).unwrap();
-                        (idle_worker.worker, idle_worker.primary_classification)
-                    });
+                    break Some((idle_worker.worker, idle_worker.primary_classification));
+                };
 
                 if worker.is_some() {
                     (worker, None, false, removed_workers)
@@ -674,31 +878,10 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
                         condition: Some(classification.clone()),
                     });
                     (None, Some(waiter), false, removed_workers)
-                } else if self
-                    .config
-                    .max_count
-                    .map(|max_count| state.current_count < usize::from(max_count))
-                    .unwrap_or(true)
-                {
-                    state.current_count += 1;
-                    state.inc_pending_classified_count(classification.clone());
-                    (None, None, true, removed_workers)
-                } else if let Some(idle_worker) = state.worker_list.pop_front() {
-                    state.dec_classified_count(idle_worker.primary_classification.clone());
-                    state.inc_pending_classified_count(classification.clone());
-                    removed_workers.push(idle_worker);
-                    (None, None, true, removed_workers)
-                } else if state.reserved_classified_count(&classification) == 0 {
-                    state.current_count += 1;
-                    state.inc_pending_classified_count(classification.clone());
-                    (None, None, true, removed_workers)
                 } else {
-                    let (notify, waiter) = Notify::new();
-                    state.waiting_list.push(WaitingItem {
-                        future: notify,
-                        condition: Some(classification.clone()),
-                    });
-                    (None, Some(waiter), false, removed_workers)
+                    state.current_count += 1;
+                    state.inc_pending_classified_count(classification.clone());
+                    (None, None, true, removed_workers)
                 }
             };
 
@@ -725,7 +908,7 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
 
             let reservation = reservation.unwrap();
             let (worker, primary_classification) =
-                match self.factory.create(Some(classification.clone())).await {
+                match self.create_worker(Some(classification.clone())).await {
                     Ok(worker) => {
                         let primary_classification =
                             Self::validate_created_worker(Some(&classification), &worker)?;
@@ -754,7 +937,7 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
             let mut state = self.state.lock().unwrap();
             let idle_workers = if !state.clearing {
                 state.clearing = true;
-                let idle_workers = state.worker_list.drain(..).collect::<Vec<_>>();
+                let idle_workers = state.drain_idle_workers();
                 let cur_worker_count = idle_workers.len();
                 state.current_count -= cur_worker_count;
                 for idle_worker in &idle_workers {
@@ -848,64 +1031,27 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
                     ReleaseAction::None
                 }
             } else if work.is_work() {
-                if let Some(index) = state.find_matching_waiter_index_for_worker(&work) {
+                if let Some(index) =
+                    state.find_matching_waiter_index_for_worker(&work, &primary_classification)
+                {
                     let waiting_item = state.waiting_list.remove(index);
                     ReleaseAction::Notify(
                         waiting_item.future,
                         ClassifiedWorkerGuard::new(work, self.clone(), primary_classification),
                     )
-                } else if let Some(index) = self.find_replaceable_classified_waiter_index(&state) {
-                    state.current_count -= 1;
-                    state.dec_classified_count(primary_classification);
-                    let mut waiters = state.drain_waiters();
-                    if index < waiters.len() {
-                        waiters.swap(0, index);
-                    }
-                    ReleaseAction::Retry(waiters)
-                } else if self
-                    .config
-                    .max_count
-                    .map(|max_count| state.current_count > usize::from(max_count))
-                    .unwrap_or(false)
-                {
-                    state.current_count -= 1;
-                    state.dec_classified_count(primary_classification);
-                    clear_waiters = state.take_clear_waiters_if_done();
-                    ReleaseAction::None
                 } else {
-                    state.worker_list.push_back(IdleWorker {
-                        worker: work,
-                        primary_classification: primary_classification.clone(),
-                        idle_since: Instant::now(),
-                    });
+                    state.push_idle_worker(work, primary_classification.clone());
                     if let Some(max_idle_count_per_classification) =
                         self.config.max_idle_count_per_classification
                     {
                         while state
                             .worker_list
-                            .iter()
-                            .filter(|idle_worker| {
-                                idle_worker.primary_classification == primary_classification
-                            })
-                            .count()
+                            .get(&primary_classification)
+                            .map(VecDeque::len)
+                            .unwrap_or(0)
                             > usize::from(max_idle_count_per_classification)
                         {
-                            let index = state
-                                .worker_list
-                                .iter()
-                                .position(|idle_worker| {
-                                    idle_worker.primary_classification == primary_classification
-                                })
-                                .unwrap();
-                            let idle_worker = state.worker_list.remove(index).unwrap();
-                            state.current_count -= 1;
-                            state.dec_classified_count(idle_worker.primary_classification.clone());
-                            removed_workers.push(idle_worker);
-                        }
-                    }
-                    if let Some(max_idle_count) = self.config.max_idle_count {
-                        while state.worker_list.len() > usize::from(max_idle_count) {
-                            let idle_worker = state.worker_list.pop_front().unwrap();
+                            let idle_worker = state.remove_idle_worker(&primary_classification, 0);
                             state.current_count -= 1;
                             state.dec_classified_count(idle_worker.primary_classification.clone());
                             removed_workers.push(idle_worker);
@@ -966,6 +1112,7 @@ mod idle_limit_tests {
 
         fn is_valid(&self, classification: Classification) -> bool {
             self.classification == classification
+                || (self.classification == Classification::A && classification == Classification::B)
         }
 
         fn classification(&self) -> Classification {
@@ -986,15 +1133,14 @@ mod idle_limit_tests {
     }
 
     #[tokio::test]
-    async fn classification_and_global_idle_limits_preserve_mru_workers() {
+    async fn classification_idle_limits_preserve_mru_workers_per_bucket() {
         let pool = ClassifiedWorkerPool::new(
             TestFactory(AtomicUsize::new(0)),
             ClassifiedWorkerPoolConfig {
-                max_count: Some(3),
-                max_idle_count: Some(2),
                 idle_timeout: None,
                 max_count_per_classification: None,
                 max_idle_count_per_classification: Some(1),
+                ..Default::default()
             },
         );
         let a0 = pool.get_classified_worker(Classification::A).await.unwrap();
@@ -1011,11 +1157,94 @@ mod idle_limit_tests {
     }
 
     #[tokio::test]
+    async fn acquisition_cleans_expired_worker_behind_bucket_mru() {
+        let pool = ClassifiedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            ClassifiedWorkerPoolConfig::default()
+                .with_idle_timeout(Some(Duration::from_millis(20))),
+        );
+        let a0 = pool.get_classified_worker(Classification::A).await.unwrap();
+        let a1 = pool.get_classified_worker(Classification::A).await.unwrap();
+
+        drop(a0);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(a1);
+
+        let a = pool.get_classified_worker(Classification::A).await.unwrap();
+        assert_eq!(a.id, 1);
+        assert_eq!(pool.cleanup_idle_worker(), 0);
+    }
+
+    #[tokio::test]
+    async fn classified_acquisition_only_cleans_and_reuses_requested_bucket() {
+        let pool = ClassifiedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            ClassifiedWorkerPoolConfig::default()
+                .with_idle_timeout(Some(Duration::from_millis(20))),
+        );
+        let a = pool.get_classified_worker(Classification::A).await.unwrap();
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let b = pool.get_classified_worker(Classification::B).await.unwrap();
+        assert_eq!(b.id, 1);
+        assert_eq!(b.classification(), Classification::B);
+        assert_eq!(pool.cleanup_idle_worker(), 1);
+    }
+
+    #[tokio::test]
+    async fn generic_acquisition_only_cleans_visited_buckets() {
+        let pool = ClassifiedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            ClassifiedWorkerPoolConfig::default()
+                .with_idle_timeout(Some(Duration::from_millis(20))),
+        );
+        let a0 = pool.get_classified_worker(Classification::A).await.unwrap();
+        let a1 = pool.get_classified_worker(Classification::A).await.unwrap();
+        let b0 = pool.get_classified_worker(Classification::B).await.unwrap();
+        let b1 = pool.get_classified_worker(Classification::B).await.unwrap();
+        drop(a0);
+        drop(b0);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(a1);
+        drop(b1);
+
+        let worker = pool.get_worker().await.unwrap();
+        assert_eq!(pool.cleanup_idle_worker(), 1);
+        drop(worker);
+    }
+
+    #[tokio::test]
+    async fn returned_worker_only_wakes_waiter_for_its_primary_classification() {
+        let pool = ClassifiedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            ClassifiedWorkerPoolConfig::default().with_max_count_per_classification(Some(1)),
+        );
+        let a = pool.get_classified_worker(Classification::A).await.unwrap();
+        let b = pool.get_classified_worker(Classification::B).await.unwrap();
+        let pool_ref = pool.clone();
+        let waiting_b =
+            tokio::spawn(async move { pool_ref.get_classified_worker(Classification::B).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(a);
+        tokio::task::yield_now().await;
+        assert!(!waiting_b.is_finished());
+
+        drop(b);
+        let b = tokio::time::timeout(Duration::from_secs(1), waiting_b)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.classification(), Classification::B);
+    }
+
+    #[tokio::test]
     async fn zero_per_classification_idle_limit_disables_idle_cache() {
         let pool = ClassifiedWorkerPool::new(
             TestFactory(AtomicUsize::new(0)),
             ClassifiedWorkerPoolConfig {
-                max_count: Some(2),
                 max_idle_count_per_classification: Some(0),
                 ..Default::default()
             },
@@ -1038,7 +1267,9 @@ fn new_classified_worker_pool<
     factory: F,
     mut config: ClassifiedWorkerPoolConfig,
 ) -> ClassifiedWorkerPoolRef<C, W, F> {
-    config.max_count = Some(max_count);
+    if config.max_count_per_classification.is_none() {
+        config.max_count_per_classification = Some(max_count);
+    }
     ClassifiedWorkerPool::new(factory, config)
 }
 
@@ -1094,14 +1325,18 @@ async fn test_pool() {
     let pool = ClassifiedWorkerPool::new(
         TestWorkerFactory,
         ClassifiedWorkerPoolConfig {
-            max_count: Some(3),
+            max_count_per_classification: Some(2),
             ..Default::default()
         },
     );
 
     let worker_a1 = pool.get_worker().await.unwrap();
     let worker_a2 = pool.get_worker().await.unwrap();
-    let worker_b = pool
+    let worker_b1 = pool
+        .get_classified_worker(TestWorkerClassification::B)
+        .await
+        .unwrap();
+    let worker_b2 = pool
         .get_classified_worker(TestWorkerClassification::B)
         .await
         .unwrap();
@@ -1115,7 +1350,7 @@ async fn test_pool() {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert!(!classified_waiter.is_finished());
 
-    drop(worker_b);
+    drop(worker_b1);
     let worker_b = tokio::time::timeout(std::time::Duration::from_secs(1), classified_waiter)
         .await
         .unwrap()
@@ -1123,9 +1358,14 @@ async fn test_pool() {
         .unwrap();
     drop(worker_a1);
     drop(worker_a2);
+    drop(worker_b2);
     drop(worker_b);
 
-    let worker3 = pool
+    let worker_b1 = pool
+        .get_classified_worker(TestWorkerClassification::B)
+        .await
+        .unwrap();
+    let worker_b2 = pool
         .get_classified_worker(TestWorkerClassification::B)
         .await
         .unwrap();
@@ -1155,7 +1395,8 @@ async fn test_pool() {
 
     drop(worker1);
     drop(worker2);
-    drop(worker3);
+    drop(worker_b1);
+    drop(worker_b2);
 
     tokio::time::timeout(std::time::Duration::from_secs(1), clear_task)
         .await
@@ -1273,7 +1514,7 @@ async fn test_concurrent_clear_all_worker() {
     let pool = ClassifiedWorkerPool::new(
         TestWorkerFactory,
         ClassifiedWorkerPoolConfig {
-            max_count: Some(1),
+            max_count_per_classification: Some(1),
             ..Default::default()
         },
     );
@@ -1301,7 +1542,7 @@ async fn test_concurrent_clear_all_worker() {
 }
 
 #[tokio::test]
-async fn test_zero_max_count_returns_error() {
+async fn test_zero_max_count_per_classification_returns_error() {
     #[derive(Clone, Debug, Eq, PartialEq, Hash)]
     enum TestWorkerClassification {
         A,
@@ -1343,7 +1584,7 @@ async fn test_zero_max_count_returns_error() {
     let pool = ClassifiedWorkerPool::new(
         TestWorkerFactory,
         ClassifiedWorkerPoolConfig {
-            max_count: Some(0),
+            max_count_per_classification: Some(0),
             ..Default::default()
         },
     );
@@ -1356,7 +1597,7 @@ async fn test_zero_max_count_returns_error() {
 }
 
 #[tokio::test]
-async fn test_default_config_has_no_max_count() {
+async fn test_default_config_has_no_per_classification_count_limit() {
     #[derive(Clone, Debug, Eq, PartialEq, Hash)]
     enum TestWorkerClassification {
         A,
@@ -1445,7 +1686,7 @@ async fn test_classified_pool_waits_when_classification_already_has_worker() {
     let pool = ClassifiedWorkerPool::new(
         TestWorkerFactory,
         ClassifiedWorkerPoolConfig {
-            max_count: Some(1),
+            max_count_per_classification: Some(1),
             ..Default::default()
         },
     );
@@ -1466,7 +1707,7 @@ async fn test_classified_pool_waits_when_classification_already_has_worker() {
 }
 
 #[tokio::test]
-async fn test_missing_classification_can_exceed_max_count_once() {
+async fn test_different_classification_is_not_blocked_by_per_classification_limit() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1580,7 +1821,7 @@ async fn test_classified_create_failure_fails_same_classification_waiters() {
     let pool = ClassifiedWorkerPool::new(
         TestWorkerFactory,
         ClassifiedWorkerPoolConfig {
-            max_count: Some(1),
+            max_count_per_classification: Some(1),
             ..Default::default()
         },
     );
@@ -1834,7 +2075,7 @@ async fn test_classified_request_replaces_non_matching_idle_worker() {
 }
 
 #[tokio::test]
-async fn test_classified_waiter_replaces_returned_non_matching_worker() {
+async fn test_other_classification_does_not_wait_for_returned_non_matching_worker() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1906,9 +2147,8 @@ async fn test_classified_waiter_replaces_returned_non_matching_worker() {
             .await
     });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    assert!(!waiter.is_finished());
+    assert!(waiter.is_finished());
 
-    drop(worker_a);
     let worker = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
         .await
         .unwrap()
@@ -1917,10 +2157,11 @@ async fn test_classified_waiter_replaces_returned_non_matching_worker() {
     assert_eq!(worker.id, 2);
     assert_eq!(worker.classification(), TestWorkerClassification::B);
     assert_eq!(create_count.load(Ordering::SeqCst), 3);
+    drop(worker_a);
 }
 
 #[tokio::test]
-async fn test_classified_waiter_replaces_unwork_non_matching_worker() {
+async fn test_other_classification_does_not_wait_for_unwork_non_matching_worker() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1994,11 +2235,9 @@ async fn test_classified_waiter_replaces_unwork_non_matching_worker() {
             .await
     });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    assert!(!waiter.is_finished());
+    assert!(waiter.is_finished());
 
     worker_a.work.store(false, Ordering::SeqCst);
-    drop(worker_a);
-
     let worker = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
         .await
         .unwrap()
@@ -2007,6 +2246,7 @@ async fn test_classified_waiter_replaces_unwork_non_matching_worker() {
     assert_eq!(worker.id, 2);
     assert_eq!(worker.classification(), TestWorkerClassification::B);
     assert_eq!(create_count.load(Ordering::SeqCst), 3);
+    drop(worker_a);
 }
 
 #[tokio::test]
@@ -2084,7 +2324,7 @@ async fn test_factory_must_return_matching_classification() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_classified_waiter_keeps_queue_priority_over_later_generic_waiter() {
+async fn test_classified_and_generic_waiters_both_progress() {
     use std::sync::mpsc;
 
     #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -2128,7 +2368,7 @@ async fn test_classified_waiter_keeps_queue_priority_over_later_generic_waiter()
     let pool = ClassifiedWorkerPool::new(
         TestWorkerFactory,
         ClassifiedWorkerPoolConfig {
-            max_count: Some(1),
+            max_count_per_classification: Some(1),
             ..Default::default()
         },
     );
@@ -2161,11 +2401,11 @@ async fn test_classified_waiter_keeps_queue_priority_over_later_generic_waiter()
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     drop(worker);
 
-    let first = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-    assert_eq!(first, "classified");
-
     classified_task.await.unwrap();
     generic_task.await.unwrap();
+    let first = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let second = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    assert_ne!(first, second);
 }
 
 #[tokio::test]
@@ -2212,7 +2452,7 @@ async fn test_generic_factory_worker_must_be_valid_for_its_primary_classificatio
     let pool = ClassifiedWorkerPool::new(
         TestWorkerFactory,
         ClassifiedWorkerPoolConfig {
-            max_count: Some(1),
+            max_count_per_classification: Some(1),
             ..Default::default()
         },
     );
@@ -2597,7 +2837,6 @@ async fn test_mutating_worker_classification_removes_returned_worker() {
         1,
         TestWorkerFactory,
         ClassifiedWorkerPoolConfig {
-            max_count: None,
             idle_timeout: None,
             max_count_per_classification: Some(1),
             ..Default::default()
@@ -2860,7 +3099,7 @@ mod affected_path_tests {
                 specs: specs.clone(),
             },
             ClassifiedWorkerPoolConfig {
-                max_idle_count,
+                max_idle_count_per_classification: max_idle_count,
                 idle_timeout,
                 ..Default::default()
             },
@@ -2900,7 +3139,6 @@ mod affected_path_tests {
         IdleLimit,
         GenericInvalidScan,
         ClassifiedInvalidScan,
-        ClassifiedReplacement,
         Clear,
     }
 
@@ -2934,11 +3172,6 @@ mod affected_path_tests {
                 let worker = pool.get_classified_worker(Classification::A).await.unwrap();
                 drop(worker);
             }
-            IdleDropPath::ClassifiedReplacement => {
-                specs.lock().unwrap().push_back(plain_drop_probe_spec());
-                let worker = pool.get_classified_worker(Classification::B).await.unwrap();
-                drop(worker);
-            }
             IdleDropPath::Clear => pool.clear_all_worker().await,
         }
 
@@ -2952,7 +3185,6 @@ mod affected_path_tests {
             IdleDropPath::IdleLimit,
             IdleDropPath::GenericInvalidScan,
             IdleDropPath::ClassifiedInvalidScan,
-            IdleDropPath::ClassifiedReplacement,
             IdleDropPath::Clear,
         ] {
             assert_idle_drop_path_runs_outside_lock(path).await;
@@ -3014,7 +3246,6 @@ mod affected_path_tests {
             max_count,
             MutableWorkerFactory,
             ClassifiedWorkerPoolConfig {
-                max_count: None,
                 idle_timeout: None,
                 max_count_per_classification: Some(max_count_per_classification),
                 ..Default::default()
@@ -3049,7 +3280,6 @@ mod affected_path_tests {
         Clear,
         GenericInvalidScan,
         ClassifiedInvalidScan,
-        ClassifiedReplacement,
     }
 
     async fn assert_idle_accounting_path(path: IdleAccountingPath) {
@@ -3084,13 +3314,6 @@ mod affected_path_tests {
                 drop(worker);
                 assert_accounting_empty(&pool);
             }
-            IdleAccountingPath::ClassifiedReplacement => {
-                let worker = pool.get_classified_worker(Classification::B).await.unwrap();
-                assert_only_classification(&pool, Classification::B, 1);
-                worker.working.store(false, Ordering::SeqCst);
-                drop(worker);
-                assert_accounting_empty(&pool);
-            }
         }
     }
 
@@ -3101,7 +3324,6 @@ mod affected_path_tests {
             IdleAccountingPath::Clear,
             IdleAccountingPath::GenericInvalidScan,
             IdleAccountingPath::ClassifiedInvalidScan,
-            IdleAccountingPath::ClassifiedReplacement,
         ] {
             assert_idle_accounting_path(path).await;
         }
@@ -3132,7 +3354,10 @@ mod affected_path_tests {
 
         let state = pool.state.lock().unwrap();
         assert!(state.waiting_list.is_empty());
-        assert_eq!(state.worker_list.len(), 1);
+        assert_eq!(
+            state.worker_list.values().map(VecDeque::len).sum::<usize>(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3193,9 +3418,17 @@ mod affected_path_tests {
         {
             let state = pool.state.lock().unwrap();
             assert_eq!(state.current_count, 2);
-            assert_eq!(state.worker_list.len(), 1);
             assert_eq!(
-                state.worker_list.front().unwrap().primary_classification,
+                state.worker_list.values().map(VecDeque::len).sum::<usize>(),
+                1
+            );
+            assert_eq!(
+                state
+                    .worker_list
+                    .get(&Classification::B)
+                    .and_then(VecDeque::front)
+                    .unwrap()
+                    .primary_classification,
                 Classification::B
             );
         }
@@ -3248,8 +3481,8 @@ mod affected_path_tests {
     }
 
     #[tokio::test]
-    async fn test_changed_classification_worker_wakes_classified_waiter() {
-        let pool = new_mutable_pool(2, None);
+    async fn test_changed_classification_worker_does_not_wake_other_waiter() {
+        let pool = new_mutable_pool(1, None);
         let mut worker_a = pool.get_classified_worker(Classification::A).await.unwrap();
         let worker_b = pool.get_classified_worker(Classification::B).await.unwrap();
         worker_a.classification = Classification::C;
@@ -3259,18 +3492,19 @@ mod affected_path_tests {
             tokio::spawn(async move { pool_ref.get_classified_worker(Classification::B).await });
         wait_for_waiter(&pool).await;
         drop(worker_a);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
 
-        let replacement_b = waiter.await.unwrap().unwrap();
-        assert_only_classification(&pool, Classification::B, 2);
-        replacement_b.working.store(false, Ordering::SeqCst);
-        worker_b.working.store(false, Ordering::SeqCst);
-        drop(replacement_b);
         drop(worker_b);
+        let replacement_b = waiter.await.unwrap().unwrap();
+        assert_only_classification(&pool, Classification::B, 1);
+        replacement_b.working.store(false, Ordering::SeqCst);
+        drop(replacement_b);
         assert_accounting_empty(&pool);
     }
 
     #[tokio::test]
-    async fn test_changed_classification_overcommit_worker_is_removed() {
+    async fn test_changed_classification_worker_is_removed_independently() {
         let pool = new_mutable_pool(1, None);
         let worker_a = pool.get_classified_worker(Classification::A).await.unwrap();
         let mut worker_b = pool.get_classified_worker(Classification::B).await.unwrap();

@@ -15,22 +15,12 @@ impl<T: Send + 'static + Clone + Hash + Eq + PartialEq> WorkerKey for T {}
 #[derive(Debug, Clone, Default)]
 /// Configuration for [`KeyedWorkerPool`].
 ///
-/// All limits default to `None`. Use the `with_*` methods to configure the pool.
+/// All options default to `None`. Use the `with_*` methods to configure the pool.
 pub struct KeyedWorkerPoolConfig {
-    /// Target maximum number of workers managed by the pool.
-    ///
-    /// `None` leaves the worker count unlimited. A finite target may be
-    /// temporarily exceeded to create a worker for a missing key.
-    max_count: Option<u16>,
-    /// Maximum number of idle workers retained across the whole pool.
-    ///
-    /// `None` adds no separate idle limit; `Some(0)` disables idle caching.
-    max_idle_count: Option<u16>,
     idle_timeout: Option<Duration>,
     /// Maximum number of workers whose primary key is the same.
     ///
-    /// `None` leaves key counts unlimited. This limit is independent
-    /// of the pool-wide `max_count` target.
+    /// `None` leaves key counts unlimited.
     max_count_per_key: Option<u16>,
     /// Maximum number of idle workers retained for each primary key.
     ///
@@ -40,22 +30,6 @@ pub struct KeyedWorkerPoolConfig {
 }
 
 impl KeyedWorkerPoolConfig {
-    /// Sets the pool-wide target worker count.
-    ///
-    /// `None` leaves the count unlimited. `Some(0)` is invalid.
-    pub fn with_max_count(mut self, max_count: Option<u16>) -> Self {
-        self.max_count = max_count;
-        self
-    }
-
-    /// Sets the pool-wide idle-worker cache limit.
-    ///
-    /// `None` adds no idle limit. `Some(0)` disables idle caching.
-    pub fn with_max_idle_count(mut self, max_idle_count: Option<u16>) -> Self {
-        self.max_idle_count = max_idle_count;
-        self
-    }
-
     /// Sets the maximum duration for which an idle worker is retained.
     ///
     /// `None` disables timeout-based cleanup.
@@ -88,8 +62,8 @@ impl KeyedWorkerPoolConfig {
 /// Implementations must be non-blocking and must not re-enter APIs on the same pool.
 pub trait KeyedWorker<K: WorkerKey>: Send + 'static {
     fn is_work(&self) -> bool;
-    /// Returns whether this worker can currently serve the requested key.
-    /// The pool still tracks capacity by the worker's `primary_key()`.
+    /// Returns whether this worker can currently serve its requested primary key.
+    /// Explicit keyed acquisition only reuses workers from that key's primary bucket.
     /// A worker that is no longer valid for its cached primary key is discarded.
     fn supports(&self, key: K) -> bool;
     /// Returns the worker's primary key used for accounting and replacement.
@@ -225,13 +199,54 @@ struct WorkerPoolState<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K,
     current_count: usize,
     worker_count_by_key: HashMap<K, usize>,
     pending_count_by_key: HashMap<K, usize>,
-    worker_list: VecDeque<IdleWorker<K, W>>,
+    // Idle workers are grouped by primary key; each bucket is ordered from LRU to MRU.
+    worker_list: HashMap<K, VecDeque<IdleWorker<K, W>>>,
     waiting_list: Vec<WaitingItem<K, W, F>>,
     clearing: bool,
     clear_waiting_list: Vec<Notify<()>>,
 }
 
 impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> WorkerPoolState<K, W, F> {
+    fn push_idle_worker(&mut self, worker: W, primary_key: K) {
+        let idle_worker = IdleWorker {
+            worker,
+            primary_key: primary_key.clone(),
+            idle_since: Instant::now(),
+        };
+        self.worker_list
+            .entry(primary_key)
+            .or_default()
+            .push_back(idle_worker);
+    }
+
+    fn remove_idle_worker(&mut self, primary_key: &K, index: usize) -> IdleWorker<K, W> {
+        let (idle_worker, remove_bucket) = {
+            let workers = self.worker_list.get_mut(primary_key).unwrap();
+            let idle_worker = workers.remove(index).unwrap();
+            (idle_worker, workers.is_empty())
+        };
+        if remove_bucket {
+            self.worker_list.remove(primary_key);
+        }
+        idle_worker
+    }
+
+    fn take_idle_worker_for_key(&mut self, key: &K) -> Option<IdleWorker<K, W>> {
+        let index = self
+            .worker_list
+            .get(key)
+            .map(VecDeque::len)
+            .and_then(|len| len.checked_sub(1))?;
+        Some(self.remove_idle_worker(key, index))
+    }
+
+    fn drain_idle_workers(&mut self) -> Vec<IdleWorker<K, W>> {
+        std::mem::take(&mut self.worker_list)
+            .into_values()
+            .flatten()
+            .collect()
+    }
+
     fn inc_worker_count_for_key(&mut self, key: K) {
         let count = self.worker_count_by_key.entry(key).or_insert(0);
         *count += 1;
@@ -280,12 +295,12 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> WorkerPoolSta
         }
     }
 
-    fn find_matching_waiter_index_for_worker(&self, worker: &W) -> Option<usize> {
+    fn find_matching_waiter_index_for_worker(&self, worker: &W, primary_key: &K) -> Option<usize> {
         self.waiting_list.iter().position(|waiting| {
             if waiting.future.is_canceled() {
                 return false;
             }
-            worker.supports(waiting.key.clone())
+            waiting.key == *primary_key && worker.supports(waiting.key.clone())
         })
     }
 
@@ -313,7 +328,6 @@ pub type KeyedWorkerPoolRef<K, W, F> = Arc<KeyedWorkerPool<K, W, F>>;
 #[test]
 fn test_keyed_worker_pool_config_default_idle_limits() {
     let config = KeyedWorkerPoolConfig::default();
-    assert_eq!(config.max_idle_count, None);
     assert_eq!(config.max_idle_count_per_key, None);
 }
 
@@ -322,13 +336,9 @@ fn test_keyed_worker_pool_config_default_idle_limits() {
 fn test_keyed_worker_pool_config_builder() {
     let timeout = Duration::from_secs(1);
     let config = KeyedWorkerPoolConfig::default()
-        .with_max_count(Some(4))
-        .with_max_idle_count(Some(3))
         .with_idle_timeout(Some(timeout))
         .with_max_count_per_key(Some(2))
         .with_max_idle_count_per_key(Some(1));
-    assert_eq!(config.max_count, Some(4));
-    assert_eq!(config.max_idle_count, Some(3));
     assert_eq!(config.idle_timeout, Some(timeout));
     assert_eq!(config.max_count_per_key, Some(2));
     assert_eq!(config.max_idle_count_per_key, Some(1));
@@ -340,12 +350,6 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
             .max_count_per_key
             .map(|max_count| state.reserved_count_for_key(key) >= usize::from(max_count))
             .unwrap_or(false)
-    }
-
-    fn find_replaceable_waiter_index(&self, state: &WorkerPoolState<K, W, F>) -> Option<usize> {
-        state.waiting_list.iter().position(|waiting| {
-            !waiting.future.is_canceled() && !self.key_limit_reached(state, &waiting.key)
-        })
     }
 
     fn validate_created_worker(requested_key: &K, worker: &W) -> PoolResult<K> {
@@ -363,15 +367,8 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
         Ok(worker_key)
     }
 
-    /// Creates a keyed worker pool with explicit configuration.
-    ///
-    /// A finite `max_count` is a target rather than a strict upper bound. When the
-    /// pool is full, no idle worker can be replaced, and a requested key
-    /// has no created or pending worker, the pool may temporarily exceed the target.
-    /// Excess workers are removed when they are returned and are not needed by a
-    /// waiter. `None` leaves the pool-wide worker count unlimited.
+    /// Creates a keyed worker pool with explicit per-key configuration.
     pub fn new(factory: F, config: KeyedWorkerPoolConfig) -> KeyedWorkerPoolRef<K, W, F> {
-        let idle_capacity = config.max_count.unwrap_or(0) as usize;
         Arc::new(KeyedWorkerPool {
             factory: Arc::new(factory),
             config,
@@ -379,7 +376,7 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
                 current_count: 0,
                 worker_count_by_key: HashMap::new(),
                 pending_count_by_key: HashMap::new(),
-                worker_list: VecDeque::with_capacity(idle_capacity),
+                worker_list: HashMap::new(),
                 waiting_list: Vec::new(),
                 clearing: false,
                 clear_waiting_list: Vec::new(),
@@ -396,16 +393,51 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
         };
         let mut removed_workers = Vec::new();
         let now = Instant::now();
-        while state
-            .worker_list
-            .front()
-            .map(|idle_worker| now.duration_since(idle_worker.idle_since) >= idle_timeout)
-            .unwrap_or(false)
-        {
-            let idle_worker = state.worker_list.pop_front().unwrap();
+        for workers in state.worker_list.values_mut() {
+            while workers
+                .front()
+                .map(|idle_worker| now.duration_since(idle_worker.idle_since) >= idle_timeout)
+                .unwrap_or(false)
+            {
+                removed_workers.push(workers.pop_front().unwrap());
+            }
+        }
+        state.worker_list.retain(|_, workers| !workers.is_empty());
+        for idle_worker in &removed_workers {
             state.current_count -= 1;
             state.dec_worker_count_for_key(idle_worker.primary_key.clone());
-            removed_workers.push(idle_worker);
+        }
+        removed_workers
+    }
+
+    fn take_expired_idle_workers_for_key(
+        state: &mut WorkerPoolState<K, W, F>,
+        key: &K,
+        idle_timeout: Option<Duration>,
+    ) -> Vec<IdleWorker<K, W>> {
+        let Some(idle_timeout) = idle_timeout else {
+            return Vec::new();
+        };
+        let mut removed_workers = Vec::new();
+        let now = Instant::now();
+        let remove_bucket = if let Some(workers) = state.worker_list.get_mut(key) {
+            while workers
+                .front()
+                .map(|idle_worker| now.duration_since(idle_worker.idle_since) >= idle_timeout)
+                .unwrap_or(false)
+            {
+                removed_workers.push(workers.pop_front().unwrap());
+            }
+            workers.is_empty()
+        } else {
+            false
+        };
+        if remove_bucket {
+            state.worker_list.remove(key);
+        }
+        for idle_worker in &removed_workers {
+            state.current_count -= 1;
+            state.dec_worker_count_for_key(idle_worker.primary_key.clone());
         }
         removed_workers
     }
@@ -431,9 +463,6 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
         key: K,
     ) -> PoolResult<KeyedWorkerGuard<K, W, F>> {
         loop {
-            if self.config.max_count == Some(0) {
-                return Err(pool_invalid_config_error("pool max_count is zero"));
-            }
             if self.config.max_count_per_key == Some(0) {
                 return Err(pool_invalid_config_error("pool max_count_per_key is zero"));
             }
@@ -445,32 +474,33 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
                 }
                 state.remove_canceled_waiters();
 
-                let mut removed_workers =
-                    Self::take_expired_idle_workers(&mut state, self.config.idle_timeout);
+                let mut removed_workers = Self::take_expired_idle_workers_for_key(
+                    &mut state,
+                    &key,
+                    self.config.idle_timeout,
+                );
 
-                let mut valid_workers = VecDeque::with_capacity(state.worker_list.len());
-                while let Some(idle_worker) = state.worker_list.pop_front() {
-                    if idle_worker.worker.is_work()
-                        && idle_worker.worker.primary_key() == idle_worker.primary_key
-                        && idle_worker.worker.supports(idle_worker.primary_key.clone())
+                let worker = loop {
+                    let Some(idle_worker) = state.take_idle_worker_for_key(&key) else {
+                        break None;
+                    };
+                    let expired = self
+                        .config
+                        .idle_timeout
+                        .map(|idle_timeout| idle_worker.idle_since.elapsed() >= idle_timeout)
+                        .unwrap_or(false);
+                    if expired
+                        || !idle_worker.worker.is_work()
+                        || idle_worker.worker.primary_key() != idle_worker.primary_key
+                        || !idle_worker.worker.supports(idle_worker.primary_key.clone())
                     {
-                        valid_workers.push_back(idle_worker);
-                    } else {
                         state.current_count -= 1;
                         state.dec_worker_count_for_key(idle_worker.primary_key.clone());
                         removed_workers.push(idle_worker);
+                        continue;
                     }
-                }
-                state.worker_list = valid_workers;
-
-                let worker = state
-                    .worker_list
-                    .iter()
-                    .rposition(|idle_worker| idle_worker.worker.supports(key.clone()))
-                    .map(|index| {
-                        let idle_worker = state.worker_list.remove(index).unwrap();
-                        (idle_worker.worker, idle_worker.primary_key)
-                    });
+                    break Some((idle_worker.worker, idle_worker.primary_key));
+                };
 
                 if worker.is_some() {
                     (worker, None, false, removed_workers)
@@ -481,31 +511,10 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
                         key: key.clone(),
                     });
                     (None, Some(waiter), false, removed_workers)
-                } else if self
-                    .config
-                    .max_count
-                    .map(|max_count| state.current_count < usize::from(max_count))
-                    .unwrap_or(true)
-                {
-                    state.current_count += 1;
-                    state.inc_pending_count_for_key(key.clone());
-                    (None, None, true, removed_workers)
-                } else if let Some(idle_worker) = state.worker_list.pop_front() {
-                    state.dec_worker_count_for_key(idle_worker.primary_key.clone());
-                    state.inc_pending_count_for_key(key.clone());
-                    removed_workers.push(idle_worker);
-                    (None, None, true, removed_workers)
-                } else if state.reserved_count_for_key(&key) == 0 {
-                    state.current_count += 1;
-                    state.inc_pending_count_for_key(key.clone());
-                    (None, None, true, removed_workers)
                 } else {
-                    let (notify, waiter) = Notify::new();
-                    state.waiting_list.push(WaitingItem {
-                        future: notify,
-                        key: key.clone(),
-                    });
-                    (None, Some(waiter), false, removed_workers)
+                    state.current_count += 1;
+                    state.inc_pending_count_for_key(key.clone());
+                    (None, None, true, removed_workers)
                 }
             };
 
@@ -546,7 +555,7 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
             let mut state = self.state.lock().unwrap();
             let idle_workers = if !state.clearing {
                 state.clearing = true;
-                let idle_workers = state.worker_list.drain(..).collect::<Vec<_>>();
+                let idle_workers = state.drain_idle_workers();
                 let cur_worker_count = idle_workers.len();
                 state.current_count -= cur_worker_count;
                 for idle_worker in &idle_workers {
@@ -634,58 +643,25 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
                     ReleaseAction::None
                 }
             } else if work.is_work() {
-                if let Some(index) = state.find_matching_waiter_index_for_worker(&work) {
+                if let Some(index) =
+                    state.find_matching_waiter_index_for_worker(&work, &primary_key)
+                {
                     let waiting_item = state.waiting_list.remove(index);
                     ReleaseAction::Notify(
                         waiting_item.future,
                         KeyedWorkerGuard::new(work, self.clone(), primary_key),
                     )
-                } else if let Some(index) = self.find_replaceable_waiter_index(&state) {
-                    state.current_count -= 1;
-                    state.dec_worker_count_for_key(primary_key);
-                    let mut waiters = state.drain_waiters();
-                    if index < waiters.len() {
-                        waiters.swap(0, index);
-                    }
-                    ReleaseAction::Retry(waiters)
-                } else if self
-                    .config
-                    .max_count
-                    .map(|max_count| state.current_count > usize::from(max_count))
-                    .unwrap_or(false)
-                {
-                    state.current_count -= 1;
-                    state.dec_worker_count_for_key(primary_key);
-                    clear_waiters = state.take_clear_waiters_if_done();
-                    ReleaseAction::None
                 } else {
-                    state.worker_list.push_back(IdleWorker {
-                        worker: work,
-                        primary_key: primary_key.clone(),
-                        idle_since: Instant::now(),
-                    });
+                    state.push_idle_worker(work, primary_key.clone());
                     if let Some(max_idle_count_per_key) = self.config.max_idle_count_per_key {
                         while state
                             .worker_list
-                            .iter()
-                            .filter(|idle_worker| idle_worker.primary_key == primary_key)
-                            .count()
+                            .get(&primary_key)
+                            .map(VecDeque::len)
+                            .unwrap_or(0)
                             > usize::from(max_idle_count_per_key)
                         {
-                            let index = state
-                                .worker_list
-                                .iter()
-                                .position(|idle_worker| idle_worker.primary_key == primary_key)
-                                .unwrap();
-                            let idle_worker = state.worker_list.remove(index).unwrap();
-                            state.current_count -= 1;
-                            state.dec_worker_count_for_key(idle_worker.primary_key.clone());
-                            removed_workers.push(idle_worker);
-                        }
-                    }
-                    if let Some(max_idle_count) = self.config.max_idle_count {
-                        while state.worker_list.len() > usize::from(max_idle_count) {
-                            let idle_worker = state.worker_list.pop_front().unwrap();
+                            let idle_worker = state.remove_idle_worker(&primary_key, 0);
                             state.current_count -= 1;
                             state.dec_worker_count_for_key(idle_worker.primary_key.clone());
                             removed_workers.push(idle_worker);
@@ -745,7 +721,7 @@ mod idle_limit_tests {
         }
 
         fn supports(&self, key: Key) -> bool {
-            self.key == key
+            self.key == key || (self.key == Key::A && key == Key::B)
         }
 
         fn primary_key(&self) -> Key {
@@ -765,15 +741,10 @@ mod idle_limit_tests {
         }
     }
 
-    fn new_pool(
-        global_idle: u16,
-        per_key_idle: u16,
-    ) -> KeyedWorkerPoolRef<Key, TestWorker, TestFactory> {
+    fn new_pool(per_key_idle: u16) -> KeyedWorkerPoolRef<Key, TestWorker, TestFactory> {
         KeyedWorkerPool::new(
             TestFactory(AtomicUsize::new(0)),
             KeyedWorkerPoolConfig {
-                max_count: Some(3),
-                max_idle_count: Some(global_idle),
                 max_count_per_key: None,
                 max_idle_count_per_key: Some(per_key_idle),
                 idle_timeout: None,
@@ -783,7 +754,7 @@ mod idle_limit_tests {
 
     #[tokio::test]
     async fn per_key_idle_limits_are_isolated_and_evict_key_lru() {
-        let pool = new_pool(2, 1);
+        let pool = new_pool(1);
         let a0 = pool.get_worker(Key::A).await.unwrap();
         let a1 = pool.get_worker(Key::A).await.unwrap();
         let b2 = pool.get_worker(Key::B).await.unwrap();
@@ -798,22 +769,67 @@ mod idle_limit_tests {
     }
 
     #[tokio::test]
-    async fn global_idle_limit_evicts_pool_lru_after_per_key_limit() {
-        let pool = new_pool(1, 2);
+    async fn acquisition_cleans_expired_worker_behind_bucket_mru() {
+        let pool = KeyedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            KeyedWorkerPoolConfig::default().with_idle_timeout(Some(Duration::from_millis(20))),
+        );
+        let a0 = pool.get_worker(Key::A).await.unwrap();
+        let a1 = pool.get_worker(Key::A).await.unwrap();
+
+        drop(a0);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(a1);
+
         let a = pool.get_worker(Key::A).await.unwrap();
-        let b = pool.get_worker(Key::B).await.unwrap();
+        assert_eq!(a.id, 1);
+        assert_eq!(pool.cleanup_idle_worker(), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_acquisition_only_cleans_and_reuses_requested_bucket() {
+        let pool = KeyedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            KeyedWorkerPoolConfig::default().with_idle_timeout(Some(Duration::from_millis(20))),
+        );
+        let a = pool.get_worker(Key::A).await.unwrap();
         drop(a);
-        drop(b);
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
         let b = pool.get_worker(Key::B).await.unwrap();
         assert_eq!(b.id, 1);
+        assert_eq!(b.primary_key(), Key::B);
+        assert_eq!(pool.cleanup_idle_worker(), 1);
+    }
+
+    #[tokio::test]
+    async fn returned_worker_only_wakes_waiter_for_its_primary_key() {
+        let pool = KeyedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            KeyedWorkerPoolConfig::default().with_max_count_per_key(Some(1)),
+        );
         let a = pool.get_worker(Key::A).await.unwrap();
-        assert_eq!(a.id, 2);
+        let b = pool.get_worker(Key::B).await.unwrap();
+        let pool_ref = pool.clone();
+        let waiting_b = tokio::spawn(async move { pool_ref.get_worker(Key::B).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(a);
+        tokio::task::yield_now().await;
+        assert!(!waiting_b.is_finished());
+
+        drop(b);
+        let b = tokio::time::timeout(Duration::from_secs(1), waiting_b)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.primary_key(), Key::B);
     }
 
     #[tokio::test]
     async fn zero_per_key_idle_limit_disables_idle_cache() {
-        let pool = new_pool(3, 0);
+        let pool = new_pool(0);
         let a = pool.get_worker(Key::A).await.unwrap();
         assert_eq!(a.id, 0);
         drop(a);
@@ -830,7 +846,7 @@ fn new_keyed_worker_pool<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<
     KeyedWorkerPool::new(
         factory,
         KeyedWorkerPoolConfig {
-            max_count: Some(max_count),
+            max_count_per_key: Some(max_count),
             ..Default::default()
         },
     )
@@ -872,18 +888,19 @@ async fn test_pool() {
         }
     }
 
-    let pool = new_keyed_worker_pool(3, TestWorkerFactory);
+    let pool = new_keyed_worker_pool(2, TestWorkerFactory);
 
     let worker_a1 = pool.get_worker(TestWorkerKey::A).await.unwrap();
     let worker_a2 = pool.get_worker(TestWorkerKey::A).await.unwrap();
-    let worker_b = pool.get_worker(TestWorkerKey::B).await.unwrap();
+    let worker_b1 = pool.get_worker(TestWorkerKey::B).await.unwrap();
+    let worker_b2 = pool.get_worker(TestWorkerKey::B).await.unwrap();
 
     let pool_ref = pool.clone();
     let keyed_waiter = tokio::spawn(async move { pool_ref.get_worker(TestWorkerKey::B).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert!(!keyed_waiter.is_finished());
 
-    drop(worker_b);
+    drop(worker_b1);
     let worker_b = tokio::time::timeout(std::time::Duration::from_secs(1), keyed_waiter)
         .await
         .unwrap()
@@ -891,9 +908,11 @@ async fn test_pool() {
         .unwrap();
     drop(worker_a1);
     drop(worker_a2);
+    drop(worker_b2);
     drop(worker_b);
 
-    let worker3 = pool.get_worker(TestWorkerKey::B).await.unwrap();
+    let worker_b1 = pool.get_worker(TestWorkerKey::B).await.unwrap();
+    let worker_b2 = pool.get_worker(TestWorkerKey::B).await.unwrap();
     let worker1 = pool.get_worker(TestWorkerKey::A).await.unwrap();
     let worker2 = pool.get_worker(TestWorkerKey::A).await.unwrap();
 
@@ -916,7 +935,8 @@ async fn test_pool() {
 
     drop(worker1);
     drop(worker2);
-    drop(worker3);
+    drop(worker_b1);
+    drop(worker_b2);
 
     tokio::time::timeout(std::time::Duration::from_secs(1), clear_task)
         .await
@@ -1045,7 +1065,7 @@ async fn test_concurrent_clear_all_worker() {
 }
 
 #[tokio::test]
-async fn test_zero_max_count_returns_error() {
+async fn test_zero_max_count_per_key_returns_error() {
     #[derive(Clone, Debug, Eq, PartialEq, Hash)]
     enum TestWorkerKey {
         A,
@@ -1089,7 +1109,7 @@ async fn test_zero_max_count_returns_error() {
 }
 
 #[tokio::test]
-async fn test_keyed_pool_default_config_has_no_max_count() {
+async fn test_keyed_pool_default_config_has_no_per_key_count_limit() {
     #[derive(Clone, Debug, Eq, PartialEq, Hash)]
     struct TestWorkerKey;
 
@@ -1172,7 +1192,7 @@ async fn test_keyed_pool_waits_when_key_already_has_worker() {
 }
 
 #[tokio::test]
-async fn test_missing_key_can_exceed_max_count_once() {
+async fn test_different_key_is_not_blocked_by_per_key_limit() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1483,7 +1503,7 @@ async fn test_keyed_request_replaces_non_matching_idle_worker() {
 }
 
 #[tokio::test]
-async fn test_keyed_waiter_replaces_returned_non_matching_worker() {
+async fn test_other_key_does_not_wait_for_returned_non_matching_worker() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1538,9 +1558,8 @@ async fn test_keyed_waiter_replaces_returned_non_matching_worker() {
     let pool_ref = pool.clone();
     let waiter = tokio::spawn(async move { pool_ref.get_worker(TestWorkerKey::B).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    assert!(!waiter.is_finished());
+    assert!(waiter.is_finished());
 
-    drop(worker_a);
     let worker = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
         .await
         .unwrap()
@@ -1549,10 +1568,11 @@ async fn test_keyed_waiter_replaces_returned_non_matching_worker() {
     assert_eq!(worker.id, 2);
     assert_eq!(worker.primary_key(), TestWorkerKey::B);
     assert_eq!(create_count.load(Ordering::SeqCst), 3);
+    drop(worker_a);
 }
 
 #[tokio::test]
-async fn test_keyed_waiter_replaces_unwork_non_matching_worker() {
+async fn test_other_key_does_not_wait_for_unwork_non_matching_worker() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1612,11 +1632,9 @@ async fn test_keyed_waiter_replaces_unwork_non_matching_worker() {
     let pool_ref = pool.clone();
     let waiter = tokio::spawn(async move { pool_ref.get_worker(TestWorkerKey::B).await });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    assert!(!waiter.is_finished());
+    assert!(waiter.is_finished());
 
     worker_a.work.store(false, Ordering::SeqCst);
-    drop(worker_a);
-
     let worker = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
         .await
         .unwrap()
@@ -1625,6 +1643,7 @@ async fn test_keyed_waiter_replaces_unwork_non_matching_worker() {
     assert_eq!(worker.id, 2);
     assert_eq!(worker.primary_key(), TestWorkerKey::B);
     assert_eq!(create_count.load(Ordering::SeqCst), 3);
+    drop(worker_a);
 }
 
 #[tokio::test]
@@ -1853,7 +1872,7 @@ async fn test_keyed_idle_worker_timeout_releases_worker() {
             create_count: create_count.clone(),
         },
         KeyedWorkerPoolConfig {
-            max_count: Some(1),
+            max_count_per_key: Some(1),
             idle_timeout: Some(std::time::Duration::from_millis(30)),
             ..Default::default()
         },
@@ -1985,7 +2004,7 @@ async fn test_keyed_cleanup_idle_worker_can_be_triggered_externally() {
             create_count: create_count.clone(),
         },
         KeyedWorkerPoolConfig {
-            max_count: Some(1),
+            max_count_per_key: Some(1),
             idle_timeout: Some(std::time::Duration::from_millis(30)),
             ..Default::default()
         },
@@ -2122,7 +2141,6 @@ async fn test_mutating_worker_key_removes_returned_worker() {
     let pool = KeyedWorkerPool::new(
         TestWorkerFactory,
         KeyedWorkerPoolConfig {
-            max_count: Some(1),
             idle_timeout: None,
             max_count_per_key: Some(1),
             ..Default::default()
@@ -2364,10 +2382,9 @@ mod affected_path_tests {
                 specs: specs.clone(),
             },
             KeyedWorkerPoolConfig {
-                max_count: Some(1),
-                max_idle_count,
+                max_count_per_key: Some(1),
+                max_idle_count_per_key: max_idle_count,
                 idle_timeout,
-                ..Default::default()
             },
         );
         (pool, specs)
@@ -2404,7 +2421,6 @@ mod affected_path_tests {
         Cleanup,
         IdleLimit,
         KeyedInvalidScan,
-        KeyedReplacement,
         Clear,
     }
 
@@ -2432,11 +2448,6 @@ mod affected_path_tests {
                 let worker = pool.get_worker(Key::A).await.unwrap();
                 drop(worker);
             }
-            IdleDropPath::KeyedReplacement => {
-                specs.lock().unwrap().push_back(plain_drop_probe_spec());
-                let worker = pool.get_worker(Key::B).await.unwrap();
-                drop(worker);
-            }
             IdleDropPath::Clear => pool.clear_all_worker().await,
         }
 
@@ -2449,7 +2460,6 @@ mod affected_path_tests {
             IdleDropPath::Cleanup,
             IdleDropPath::IdleLimit,
             IdleDropPath::KeyedInvalidScan,
-            IdleDropPath::KeyedReplacement,
             IdleDropPath::Clear,
         ] {
             assert_idle_drop_path_runs_outside_lock(path).await;
@@ -2496,18 +2506,17 @@ mod affected_path_tests {
         KeyedWorkerPool::new(
             MutableWorkerFactory,
             KeyedWorkerPoolConfig {
-                max_count: Some(max_count),
+                max_count_per_key: Some(max_count),
                 idle_timeout,
                 ..Default::default()
             },
         )
     }
 
-    fn new_limited_mutable_pool(max_count: u16, max_count_per_key: u16) -> MutablePool {
+    fn new_limited_mutable_pool(_max_count: u16, max_count_per_key: u16) -> MutablePool {
         KeyedWorkerPool::new(
             MutableWorkerFactory,
             KeyedWorkerPoolConfig {
-                max_count: Some(max_count),
                 idle_timeout: None,
                 max_count_per_key: Some(max_count_per_key),
                 ..Default::default()
@@ -2534,7 +2543,6 @@ mod affected_path_tests {
         Cleanup,
         Clear,
         KeyedInvalidScan,
-        KeyedReplacement,
     }
 
     async fn assert_idle_accounting_path(path: IdleAccountingPath) {
@@ -2561,13 +2569,6 @@ mod affected_path_tests {
                 drop(worker);
                 assert_accounting_empty(&pool);
             }
-            IdleAccountingPath::KeyedReplacement => {
-                let worker = pool.get_worker(Key::B).await.unwrap();
-                assert_only_key(&pool, Key::B, 1);
-                worker.working.store(false, Ordering::SeqCst);
-                drop(worker);
-                assert_accounting_empty(&pool);
-            }
         }
     }
 
@@ -2577,7 +2578,6 @@ mod affected_path_tests {
             IdleAccountingPath::Cleanup,
             IdleAccountingPath::Clear,
             IdleAccountingPath::KeyedInvalidScan,
-            IdleAccountingPath::KeyedReplacement,
         ] {
             assert_idle_accounting_path(path).await;
         }
@@ -2607,7 +2607,10 @@ mod affected_path_tests {
 
         let state = pool.state.lock().unwrap();
         assert!(state.waiting_list.is_empty());
-        assert_eq!(state.worker_list.len(), 1);
+        assert_eq!(
+            state.worker_list.values().map(VecDeque::len).sum::<usize>(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2663,8 +2666,19 @@ mod affected_path_tests {
         {
             let state = pool.state.lock().unwrap();
             assert_eq!(state.current_count, 2);
-            assert_eq!(state.worker_list.len(), 1);
-            assert_eq!(state.worker_list.front().unwrap().primary_key, Key::B);
+            assert_eq!(
+                state.worker_list.values().map(VecDeque::len).sum::<usize>(),
+                1
+            );
+            assert_eq!(
+                state
+                    .worker_list
+                    .get(&Key::B)
+                    .and_then(VecDeque::front)
+                    .unwrap()
+                    .primary_key,
+                Key::B
+            );
         }
         assert!(!waiting_a.is_finished());
 
@@ -2715,8 +2729,8 @@ mod affected_path_tests {
     }
 
     #[tokio::test]
-    async fn test_changed_key_worker_wakes_keyed_waiter() {
-        let pool = new_mutable_pool(2, None);
+    async fn test_changed_key_worker_does_not_wake_other_key_waiter() {
+        let pool = new_mutable_pool(1, None);
         let mut worker_a = pool.get_worker(Key::A).await.unwrap();
         let worker_b = pool.get_worker(Key::B).await.unwrap();
         worker_a.key = Key::C;
@@ -2725,18 +2739,19 @@ mod affected_path_tests {
         let waiter = tokio::spawn(async move { pool_ref.get_worker(Key::B).await });
         wait_for_waiter(&pool).await;
         drop(worker_a);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
 
-        let replacement_b = waiter.await.unwrap().unwrap();
-        assert_only_key(&pool, Key::B, 2);
-        replacement_b.working.store(false, Ordering::SeqCst);
-        worker_b.working.store(false, Ordering::SeqCst);
-        drop(replacement_b);
         drop(worker_b);
+        let replacement_b = waiter.await.unwrap().unwrap();
+        assert_only_key(&pool, Key::B, 1);
+        replacement_b.working.store(false, Ordering::SeqCst);
+        drop(replacement_b);
         assert_accounting_empty(&pool);
     }
 
     #[tokio::test]
-    async fn test_changed_key_overcommit_worker_is_removed() {
+    async fn test_changed_key_worker_is_removed_independently() {
         let pool = new_mutable_pool(1, None);
         let worker_a = pool.get_worker(Key::A).await.unwrap();
         let mut worker_b = pool.get_worker(Key::B).await.unwrap();

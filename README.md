@@ -156,8 +156,6 @@ async fn main() -> PoolResult<()> {
     let pool = KeyedWorkerPool::new(
         RegionalConnectionFactory,
         KeyedWorkerPoolConfig::default()
-            .with_max_count(Some(16))
-            .with_max_idle_count(Some(8))
             .with_max_count_per_key(Some(4))
             .with_max_idle_count_per_key(Some(2)),
     );
@@ -178,11 +176,15 @@ Otherwise, acquisition returns `PoolErrorCode::InvalidConfig`. A worker's primar
 
 ### Keyed capacity semantics
 
-`KeyedWorkerPoolConfig::max_count` is a target rather than a strict upper bound. When the pool is full, no idle worker can be replaced, and the requested key has no existing or pending worker, the pool may temporarily exceed this value to create a worker. Excess workers are removed after they are returned and no waiter needs them.
+`max_count_per_key` is an independent hard limit for each key. Once the limit is reached, new requests for that key wait for an existing worker. `None` leaves each key unlimited, while `Some(0)` causes requests to return an invalid-configuration error. There is no pool-wide worker-count limit, so activity for one key does not consume another key's capacity.
 
-`max_count_per_key` is an independent hard limit for each key. Once the limit is reached, new requests for that key wait for an existing worker. Set either limit to `None` for no limit. Setting a relevant limit to `Some(0)` causes affected requests to return an invalid-configuration error.
+`max_idle_count_per_key` independently limits the idle cache for each primary key and counts neither checked-out nor pending workers. On return, a worker is handed directly to a compatible waiter when possible; otherwise it becomes the MRU worker in its primary-key bucket. When a bucket exceeds its limit, its oldest idle worker is evicted. `None` leaves each bucket unlimited; zero disables idle caching. There is no pool-wide idle-cache limit.
 
-`max_idle_count` is the pool-wide idle LRU-cache limit, while `max_idle_count_per_key` is an independent idle-cache limit for each primary key. These limits count neither checked-out nor pending workers. On return, a worker is handed directly to a compatible waiter when possible; otherwise it becomes MRU. The pool first evicts the oldest idle worker for an over-limit key, then evicts the pool-wide LRU if needed. Both fields default to `None`; zero disables the corresponding idle cache. All configuration values are set through the `with_*` builder methods.
+Explicit keyed acquisition only cleans and reuses the requested key's primary bucket. Workers from other primary-key buckets are not considered, even if `worker.supports(requested_key)` would return `true`.
+
+## Classified worker creation concurrency
+
+`ClassifiedWorkerPoolConfig` limits concurrent calls to `ClassifiedWorkerFactory::create` to 20 by default. The limit is shared by generic `get_worker()` calls and classification-specific `get_classified_worker()` calls, preventing bursts of speculative generic creation from exhausting resources. Use `with_max_concurrent_creation_count()` to change it; zero is invalid and causes acquisition to return `PoolErrorCode::InvalidConfig`.
 
 ## Clearing and errors
 
@@ -208,7 +210,7 @@ The public error types are:
 
 `Worker::is_work()`, `KeyedWorker::is_work()`, `KeyedWorker::supports()`, and `KeyedWorker::primary_key()` may be called while the pool's internal state lock is held. These methods must be fast and non-blocking, and they must not re-enter APIs on the same pool.
 
-Idle timeouts do not start a background cleanup task. Expired workers are removed before a subsequent `get_worker()` call, and applications can also call `cleanup_idle_worker()` periodically.
+Idle timeouts do not start a background cleanup task. Explicit keyed or classified acquisition cleans only the requested bucket. A classification-free acquisition cleans each bucket it actually traverses while looking for a worker. Applications can call `cleanup_idle_worker()` to scan every idle bucket explicitly.
 
 ## Development
 

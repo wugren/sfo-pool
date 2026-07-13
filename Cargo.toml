@@ -1,6 +1,6 @@
 [package]
 name = "sfo-pool"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 license-file = "LICENSE"
 repository = "https://github.com/wugren/sfo-pool.git"
@@ -8,7 +8,7 @@ description = "A work allocation pool"
 exclude = ["doc/**", "AGENTS.md"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 async-trait = "0.1"
 notify-future = "0.2"
 sfo-result = "0.2"

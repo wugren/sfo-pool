@@ -38,14 +38,14 @@
 
 库围绕四组抽象组织：
 
-1. `Worker` / `KeyedWorker`
-2. `WorkerFactory` / `KeyedWorkerFactory`
-3. `WorkerPool` / `KeyedWorkerPool`
-4. `WorkerGuard` / `KeyedWorkerGuard`
+1. `Worker` / `KeyedWorker` / `ClassifiedWorker`
+2. `WorkerFactory` / `KeyedWorkerFactory` / `ClassifiedWorkerFactory`
+3. `WorkerPool` / `KeyedWorkerPool` / `ClassifiedWorkerPool`
+4. 对应的 RAII worker guard
 
 设计上采用 RAII：
 
-- 通用池通过 `get_worker()` 获取 guard，键池通过 `get_worker(key)` 获取明确键的 guard。
+- 通用池通过 `get_worker()` 获取 guard，键池通过 `get_worker(key)` 获取明确键的 guard，分类池同时支持通用获取和指定分类获取。
 - guard 持有真实 worker。
 - guard `Drop` 时自动将 worker 归还给池。
 - 键 guard 保留可变解引用；池会缓存 factory 创建并校验时的主键。worker 归还时如果当前键与缓存的主键不一致，池会直接删除该 worker，避免键计数与实际状态不一致。
@@ -54,7 +54,7 @@
 
 ### 3.2 状态管理
 
-两个池都使用：
+三个池都使用：
 
 - `Arc` 共享池实例
 - `Mutex` 保护内部状态
@@ -63,7 +63,8 @@
 - `current_count` 跟踪当前池中已创建但尚未彻底销毁的 worker 数量
 - `clear_waiting_list` 协调 `clear_all_worker()` 对借出中 worker 或创建中 worker 的等待
 - `WorkerPoolConfig` 控制通用池可选的总量上限和 idle worker 释放策略
-- `KeyedWorkerPoolConfig` 控制键池可选的总量目标、idle worker 释放策略和单键 worker 数量上限
+- `KeyedWorkerPoolConfig` 控制键池的 idle worker 释放策略和单键 worker 数量上限
+- `ClassifiedWorkerPoolConfig` 控制分类池的创建并发、idle worker 释放策略和单分类 worker 数量上限
 
 因此它们的并发模型是：
 
@@ -173,7 +174,7 @@ worker 在池中的状态可以抽象为：
 - `KeyedWorker::supports(key)`: 判断 worker 是否可处理目标键
 - `KeyedWorker::primary_key()`: 返回 worker 的自身键
 - `KeyedWorkerFactory::create(K)`: 按明确键创建 worker
-- `KeyedWorkerPool::new(factory, config)`: 创建键池；配置可省略总量目标
+- `KeyedWorkerPool::new(factory, config)`: 创建键池
 - `KeyedWorkerPool::cleanup_idle_worker()`: 显式触发 idle worker 懒惰清理
 
 `KeyedWorker` trait 方法可能在池的内部状态锁持有期间被调用，因此实现必须快速、非阻塞，并且不能重入同一个池的 API。
@@ -185,7 +186,7 @@ worker 在池中的状态可以抽象为：
 - `worker_count_by_key`: 按键统计已创建 worker 数量
 - `pending_count_by_key`: 按键统计已经预留名额、但 `factory.create(key)` 尚未完成的创建任务数量
 - `waiting_list`: 每个等待项都带一个明确的 `key: K`
-- `worker_list`: 带 `idle_since` 的 idle worker 队列，头部最旧、尾部最新
+- `worker_list`: 按主键分桶的 idle worker map，每个桶内头部最旧、尾部最新
 
 已取消的等待项会在后续获取或 worker 归还时从等待队列中删除。键池不提供无键的 `get_worker()`，因此创建、等待和重试始终携带明确键。
 
@@ -194,16 +195,14 @@ worker 在池中的状态可以抽象为：
 `get_worker(key)` 的行为如下：
 
 1. 若正在清理，直接失败。
-2. 先懒惰清理已超时的 idle worker，并同步修正键计数。
-3. 遍历空闲列表，剔除无效 worker，并同步修正键计数。
-4. 从剩余空闲 worker 中自尾向头查找第一个 `worker.supports(key)` 的实例。
+2. 只清理目标主键桶中已超时的 idle worker，并同步修正键计数。
+3. 从目标主键桶的尾部取 MRU worker；不检查或复用其他主键桶。
+4. 候选 worker 若无效、主键变化或已不能服务缓存主键，则删除并继续查找。
 5. 若找到，直接借出。
 6. 若目标键已达到 `max_count_per_key`，进入带条件的等待队列。
-7. 若未达到单键上限，且 `max_count` 为 `None` 或 `current_count < max_count`，占用一个创建名额并创建目标键 worker。
-8. 若配置了有限 `max_count`、已达到目标且存在不匹配的 idle worker，优先淘汰最久未使用的不匹配 idle worker，并复用该名额创建目标键 worker。
-9. 若已达到有限 `max_count` 且没有 idle worker 可淘汰：
-   - 如果目标键当前没有已创建或正在创建的 worker，则临时突破 `max_count` 创建该键 worker；
-   - 否则进入带条件的等待队列。
+7. 若未达到单键上限，占用该键的创建 reservation，并在锁外创建目标键 worker。
+
+键池不再设置全池 worker 总量上限；不同 key 的容量彼此独立。
 
 ### 5.5 归还流程
 
@@ -214,18 +213,17 @@ worker 在池中的状态可以抽象为：
   - 若存在等待者，则唤醒等待者重试。
 
 - 有效 worker：
-  - 优先交付等待队列中第一个可匹配的请求；
-  - 每个等待请求都通过 `worker.supports(key)` 判断是否匹配；
-  - 如果当前 worker 不能匹配任何等待者，但存在尚未达到单键上限的键等待者，则淘汰当前 worker，并唤醒当前等待队列中的所有等待者重试；
-  - 如果当前 worker 是临时突破 `max_count` 后产生的多余容量，且没有等待者需要它，则直接释放，避免长期超过目标容量；
-  - 其他情况下带 `idle_since` 时间戳放回空闲队列尾部。
+  - 优先交付等待队列中第一个主键相同且可用的请求；
+  - 不会把 worker 交付给其他 key 的等待者；
+  - 不能匹配任何等待者时，带 `idle_since` 时间戳放回其主键桶尾部；
+  - 若该桶超过 `max_idle_count_per_key`，从桶头淘汰最久未使用的 worker。
 - 无效 worker：
   - 若存在等待者，则唤醒当前等待队列中的所有等待者重试，由等待者按自己的请求条件重新获取或创建 worker；
   - 若无等待者，则减少总数和键计数。
 
 ### 5.6 键池当前实现的隐含假设
 
-虽然接口提供了 `supports(key)`，看起来支持“一个 worker 服务多个键”的能力，但当前实现实际还依赖以下假设：
+`supports(key)` 用于校验 worker 是否仍能服务其主键，不表示池会执行跨主键复用。当前实现遵循以下规则：
 
 - 每个 worker 在创建并校验时确定一个池内主键；worker 在后续获取和归还校验中必须仍然报告该键并对该键有效，否则会被直接删除
 - 键计数是按这个主键维护的
@@ -234,7 +232,7 @@ worker 在池中的状态可以抽象为：
 - `create(key)` 必须返回 `primary_key() == key` 且对自身主键有效的 worker
 - `KeyedWorkerGuard` 提供 `DerefMut`；键计数使用创建时缓存的主键，归还时会校验当前键是否仍与其一致
 
-因此当前实现更接近“单主键 worker + 可选兼容判断”的模型，而不是完全泛化的多键能力模型。
+因此当前实现是严格的单主键分桶模型。
 
 ## 6. 并发与时序
 
@@ -318,33 +316,32 @@ sequenceDiagram
   - `max_count == 0` 时立即返回错误
   - 并发多次 `clear_all_worker()` 不会互相挂死
   - 创建过程与 clearing 并发时，请求会失败且清理能完成
-  - 键池在满池且无目标键 worker 时允许为该键临时突破 `max_count`
-  - 键池在存在不匹配 idle worker 时会淘汰 idle 并创建目标键 worker
-  - 键等待者可在不匹配 worker 归还时触发替换创建
+  - 键池按 key 独立限制 worker 数量，一个 key 达到上限不会阻塞其他 key
+  - 明确 key/classification 的获取只清理和复用目标桶
+  - 分类池无条件获取只清理查找过程中实际遍历到的桶
+  - worker 不会交付给其他 key/classification 的明确等待者
   - 键创建失败后会唤醒后续同键等待者重新获取
   - `create(key)` 返回不匹配键时会失败并回滚计数
   - factory 返回的 worker 必须对自身主键有效
   - 被取消的等待者不会阻塞后续 retry 通知
   - 创建 future 被取消时会自动释放预留名额，后续获取与清池不会永久等待
   - idle worker 在状态锁释放后才执行析构，析构重入清理接口不会死锁
-  - 键池创建、idle 替换创建和临时超限创建的取消路径均会回滚 reservation
-  - 通用池和键池的超时清理、无效 idle 扫描、键替换与清池路径均在状态锁外析构 worker
+  - 键池和分类池创建取消路径均会回滚 reservation
+  - 通用池、键池和分类池的超时清理、无效 idle 扫描与清池路径均在状态锁外析构 worker
   - worker 归还时键发生变化或对缓存的主键失效会直接删除，并唤醒键等待者重新获取
   - idle worker 对缓存的主键失效后，会在后续获取扫描中被删除并释放对应键配额
-  - 缓存主键在 idle 清理、无效扫描、替换、clearing 和超限回落路径中保持计数一致
+  - 缓存主键在 idle 清理、无效扫描、分桶淘汰和 clearing 路径中保持计数一致
   - 单键上限会阻塞对应键，但不会阻塞其他键创建
   - 同键等待者保持队列优先级
   - idle worker 超时后会释放并允许后续重新创建
   - 未超时 idle worker 会被复用
   - 多个 idle worker 中优先复用最近使用过的 worker
   - 显式调用 `cleanup_idle_worker()` 可以触发 idle 清理
+  - 分类池 factory 创建并发受共享上限约束，默认最大并发数为 20
 
 历史测试中的后台任务现在会被 `JoinHandle` 等待，避免子任务内断言失败但主测试仍通过。
 
-`cargo test` 当前结果：
-
-- 54 个测试全部通过
-- 单元测试执行耗时约 0.13 秒，不含增量编译时间
+测试数量和耗时以当前 `cargo test` 输出为准。
 
 ## 9. 实现评审结论
 
@@ -353,7 +350,7 @@ sequenceDiagram
 - `release()` 与 `clear_all_worker()` 的竞态
 - 并发多次 `clear_all_worker()` 的互相覆盖
 - 创建过程与 clearing 并发时仍返回成功
-- 键池临时突破 `max_count` 的语义已经收敛为“每个缺失键最多一个已创建或正在创建的 worker”
+- keyed/classified 池已经改为按 key/classification 独立限流，不再维护全池 worker 总量目标
 - 测试专用 import 导致的编译告警
 
 当前仍需关注的主要问题如下。
@@ -375,20 +372,18 @@ sequenceDiagram
 
 如果后续继续演进，建议逐步替换为 `tokio::time::pause()`、`advance()` 或显式通知驱动的测试写法。
 
-### 9.3 低：键池 `max_count` 现在是目标上限
+### 9.3 中：分组池没有全局 worker 数量上限
 
-配置有限 `max_count` 时，键池仍尽量保持该目标：键请求满池时，会先淘汰不匹配 idle worker 来复用名额；等待中的键请求遇到不匹配 worker 归还时，也会替换创建目标键 worker。`max_count` 为 `None` 时不限制池总量。
-
-如果所有 worker 都处于借出或创建中，没有 idle worker 可淘汰，并且目标键当前没有已创建或正在创建的 worker，键请求会临时突破 `max_count` 创建该键 worker。后续多余 worker 归还且没有等待者需要它时，会被释放以回落到目标容量。
+键池和分类池只限制每个 key/classification 的 worker 数量，因此大量不同分组仍可能累积较多 worker。空闲缓存可通过每组 idle 上限和 idle timeout 控制；分类池还通过全局创建并发上限限制 factory 的瞬时压力，默认值为 20。
 
 ## 10. 建议的后续演进
 
 ### 10.1 API 层
 
 - 当前已经有 `Clearing`、`Cleared`、`InvalidConfig` 等可区分错误码；如果调用方需要区分 factory 创建失败和配置/校验失败，可再增加类似 `CreateFailed` 或 `ValidationFailed` 的错误码。
-- 在 README 或 API 文档中显式说明 `max_count`：通用池为硬上限；键池会为缺失键临时突破该目标上限。
-- 明确键模型：单键还是多键兼容。
-- 通用池提供带显式上限的 `new(max_count, factory)` 和 `new_with_config(factory, config)`；键池提供 `new(factory, config)`。配置中的 `max_count` 默认为 `None`，表示不限制总量。如果需要真正后台自动释放，需要再增加内部定时任务或明确要求调用方周期性调用 `cleanup_idle_worker()`。
+- 在 README 或 API 文档中显式说明：通用池保留全局 `max_count`，键池和分类池只提供分组 worker 上限。
+- 保持明确 key/classification 的严格单桶模型，避免重新引入跨桶复用。
+- 通用池提供带显式上限的 `new(max_count, factory)` 和 `new_with_config(factory, config)`；键池和分类池提供 `new(factory, config)`。如果需要真正后台自动释放，需要再增加内部定时任务或明确要求调用方周期性调用 `cleanup_idle_worker()`。
 
 ### 10.2 实现层
 
@@ -415,15 +410,12 @@ let worker_config = WorkerPoolConfig::default()
     .with_idle_timeout(Some(Duration::from_secs(60)));
 
 let keyed_config = KeyedWorkerPoolConfig::default()
-    .with_max_count(Some(16))
-    .with_max_idle_count(Some(8))
     .with_idle_timeout(Some(Duration::from_secs(60)))
     .with_max_count_per_key(Some(4))
     .with_max_idle_count_per_key(Some(2));
 
 let classified_config = ClassifiedWorkerPoolConfig::default()
-    .with_max_count(Some(16))
-    .with_max_idle_count(Some(8))
+    .with_max_concurrent_creation_count(20)
     .with_idle_timeout(Some(Duration::from_secs(60)))
     .with_max_count_per_classification(Some(4))
     .with_max_idle_count_per_classification(Some(2));
@@ -431,18 +423,19 @@ let classified_config = ClassifiedWorkerPoolConfig::default()
 
 其中：
 
-- 所有配置项缺省为 `None`；
-- `max_count` 表示池总量上限；普通池严格遵守该上限，键池和分类池在为缺失的 key/classification 创建 worker 时允许临时突破该目标值；`Some(0)` 是无效配置；
+- 除分类池创建并发上限外，可选配置项缺省为 `None`；
+- `WorkerPoolConfig::max_count` 表示通用池总量硬上限；键池和分类池不提供全池 worker 数量上限；
+- `ClassifiedWorkerPoolConfig::max_concurrent_creation_count` 限制所有分类 factory 调用的总并发数，默认 20，零值无效；
 - `KeyedWorkerPoolConfig::max_count_per_key` 缺省为 `None`，表示不限制单个主键的 worker 数量；
 - `ClassifiedWorkerPoolConfig::max_count_per_classification` 缺省为 `None`，表示不限制单个主分类的 worker 数量；
 - 分组总量上限统计已创建和正在创建的 worker，`Some(0)` 是无效配置；
-- `max_idle_count` 只限制全池 idle worker 数量，不统计借出中或正在创建的 worker；
+- `WorkerPoolConfig::max_idle_count` 只限制通用池全池 idle worker 数量，不统计借出中或正在创建的 worker；
 - `max_idle_count_per_key` 和 `max_idle_count_per_classification` 分别限制单个主键、主分类的 idle worker 数量；
 - idle 上限为 `Some(0)` 时禁用对应范围的 idle 缓存，但不阻止创建或借出 worker；
 - `idle_timeout` 为 `None` 表示禁用 idle worker 超时释放，保持当前行为；
 - `idle_timeout` 为 `Some(duration)` 表示 idle worker 超过该时间后可被释放。
 
-worker 归还时优先直接交付给兼容等待者。没有兼容等待者时，worker 进入空闲队列尾部成为 MRU；键池和分类池先淘汰同 key/classification 下最旧的超限 idle worker，再按全池上限从队列头部淘汰 LRU。淘汰必须同步递减 `current_count` 和对应分组计数，worker 的析构必须发生在状态锁之外。
+worker 归还时优先直接交付给兼容等待者。没有兼容等待者时，普通池进入全局空闲队列尾部；键池和分类池进入对应主键/主分类桶尾部成为桶内 MRU。分组桶超过各自 idle 上限时，从桶头淘汰 LRU。淘汰必须同步递减 `current_count` 和对应分组计数，worker 的析构必须发生在状态锁之外。
 
 普通池已经把空闲队列元素从 `W` 调整为带时间戳的结构：
 
@@ -468,7 +461,7 @@ idle worker 懒惰释放不能破坏这个不变量，也不能让 `clear_all_wo
 
 ### 10.4 最近使用优先分配实现
 
-对外分配 worker 时，当前实现优先分配最近使用过的 idle worker。该策略适用于普通池和键池。
+对外分配 worker 时，普通池使用全局 MRU；键池和分类池在同一主键/主分类桶内使用 MRU。
 
 统一约定：
 
@@ -485,11 +478,12 @@ idle worker 懒惰释放不能破坏这个不变量，也不能让 `clear_all_wo
 
 键池：
 
-- `get_worker(key)` 应从尾部向头部查找第一个满足 `worker.supports(key)` 的 worker；
-- 键请求满池且没有匹配 idle worker 时，先淘汰最久未使用的不匹配 idle worker，再创建目标键 worker；
-- 若没有 idle worker 可淘汰，且目标键当前没有已创建或正在创建的 worker，则临时突破 `max_count` 创建目标键 worker；
-- idle 释放从头部开始释放最久未使用的 worker；
+- `get_worker(key)` 先从目标主键桶尾部取 worker；
+- 目标桶为空时直接创建或等待，不遍历其他桶；
+- 获取前只从目标桶头部释放已超时 worker；
 - 释放键 idle worker 时同步维护 `worker_count_by_key`。
+
+分类池的指定分类获取采用相同的单桶策略。无条件 `get_worker()` 可以遍历不同分类桶，但只清理实际遍历到的桶。所有 `ClassifiedWorkerFactory::create` 调用共享创建并发限制。
 
 等待者优先级不应被 MRU 策略改变：归还 worker 时如果已有可匹配等待者，应直接交付等待者，而不是先放入 idle 队列。
 
@@ -499,12 +493,12 @@ idle worker 懒惰释放不能破坏这个不变量，也不能让 `clear_all_wo
   - 无效 worker 替换时的键正确性
   - 多等待者下的公平性
   - 清池与创建失败并发发生时的回滚一致性
-  - 多键兼容 worker 的行为边界
+  - 明确 key/classification 不跨桶复用的行为边界
   - 键池释放 idle worker 后键计数保持一致
   - idle 释放与 `clear_all_worker()` 并发时不重复扣减计数、不挂死
 
 ## 11. 总结
 
-当前 `sfo-pool` 的通用池实现简洁，RAII 归还模型清晰，`clear_all_worker()` 的并发语义已经收敛。键池默认通过“淘汰不匹配 idle worker + 归还时唤醒等待者重试”的策略尽量保持 `max_count`，并会为缺失键临时突破目标容量。idle worker 目前采用“获取前清理 + 显式清理”的懒惰释放模型，并使用 MRU 策略优先复用最近归还的 worker。
+当前 `sfo-pool` 的三个池均采用 RAII 归还模型，并保持一致的 `clear_all_worker()` 清理语义。键池和分类池按主键/主分类分桶管理 idle worker，并使用桶内 MRU。明确条件的获取只清理和复用目标桶；分类池无条件获取只清理查找过程实际访问的桶。分类池通过默认 20 的共享并发上限限制 factory 创建压力。
 
 后续继续演进时，优先事项仍然是进一步收敛键池语义，并把键等待和创建决策抽成更清晰的内部状态机。

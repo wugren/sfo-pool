@@ -156,8 +156,6 @@ async fn main() -> PoolResult<()> {
     let pool = KeyedWorkerPool::new(
         RegionalConnectionFactory,
         KeyedWorkerPoolConfig::default()
-            .with_max_count(Some(16))
-            .with_max_idle_count(Some(8))
             .with_max_count_per_key(Some(4))
             .with_max_idle_count_per_key(Some(2)),
     );
@@ -178,11 +176,15 @@ async fn main() -> PoolResult<()> {
 
 ### 键池容量语义
 
-`KeyedWorkerPoolConfig::max_count` 是目标上限，而不是严格上限。当池已满、没有可替换的空闲 worker，并且请求的键当前没有已创建或正在创建的 worker 时，池可以临时超过该值创建 worker。多余 worker 会在归还且没有等待者需要时被移除。
+`max_count_per_key` 是每个键相互独立的硬限制；达到限制后，同键的新请求会等待已有 worker。`None` 表示每个键均不限制，`Some(0)` 会让请求返回无效配置错误。池不再提供全局 worker 数量限制，因此一个键的活动不会占用另一个键的容量。
 
-`max_count_per_key` 是独立的单个键硬限制；达到限制后，同键的新请求会等待已有 worker。两个上限均可设为 `None`，表示不限制。设为 `Some(0)` 时，相关请求会返回无效配置错误。
+`max_idle_count_per_key` 独立限制每个主键的空闲缓存，不统计已借出或正在创建的 worker。归还时会优先直接交付给兼容 waiter，否则成为对应主键桶中的 MRU；单桶超限时淘汰该桶最旧的空闲 worker。`None` 表示每个桶均不限制，零值禁用空闲缓存。池不再提供全局空闲缓存上限。
 
-`max_idle_count` 是全池空闲 LRU 缓存上限，`max_idle_count_per_key` 是每个主键相互独立的空闲缓存上限；两者都不统计已借出或正在创建的 worker。归还时会优先直接交付给兼容 waiter，否则插入为 MRU；超限时先淘汰该 key 最旧的空闲 worker，再按需淘汰全池 LRU。两个字段默认都是 `None`，零值禁用对应空闲缓存。所有配置值均通过 `with_*` 构建方法设置。
+明确 key 的获取只清理和复用该 key 对应的主键桶。即使其他主键桶中的 worker 对 `worker.supports(requested_key)` 返回 `true`，也不会跨桶复用。
+
+## 分类 worker 创建并发
+
+`ClassifiedWorkerPoolConfig` 默认最多允许 20 个 `ClassifiedWorkerFactory::create` 调用并发执行。通用 `get_worker()` 和指定分类的 `get_classified_worker()` 共享该限制，避免通用获取的推测创建在并发突发时耗尽资源。可通过 `with_max_concurrent_creation_count()` 调整；零值无效，获取操作会返回 `PoolErrorCode::InvalidConfig`。
 
 ## 清理与错误
 
@@ -208,7 +210,7 @@ async fn main() -> PoolResult<()> {
 
 `Worker::is_work()`、`KeyedWorker::is_work()`、`KeyedWorker::supports()` 和 `KeyedWorker::primary_key()` 可能在池的内部状态锁持有期间调用。它们必须快速、非阻塞，且不能重入同一个池的 API。
 
-空闲超时不会启动后台清理任务。过期 worker 会在后续 `get_worker()` 调用前被清理，应用也可以定期调用 `cleanup_idle_worker()`。
+空闲超时不会启动后台清理任务。明确 key 或 classification 的获取只清理请求对应的桶；不指定 classification 的获取只清理查找过程中实际遍历到的桶。应用可以调用 `cleanup_idle_worker()` 显式扫描所有空闲桶。
 
 ## 开发
 

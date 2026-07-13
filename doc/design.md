@@ -406,28 +406,43 @@ sequenceDiagram
 - 正在 `factory.create()` 的 worker 不受 idle 超时影响；
 - `clear_all_worker()` 仍然拥有最高优先级，清池过程应直接清空 idle worker，并等待借出中或创建中的 worker 完成当前语义。
 
-当前配置项：
+配置结构的字段保持私有，调用方通过 `Default` 和链式接口创建配置，避免依赖字段布局：
 
 ```rust
-pub struct WorkerPoolConfig {
-    pub max_count: Option<u16>,
-    pub idle_timeout: Option<Duration>,
-}
+let worker_config = WorkerPoolConfig::default()
+    .with_max_count(Some(16))
+    .with_max_idle_count(Some(8))
+    .with_idle_timeout(Some(Duration::from_secs(60)));
 
-pub struct KeyedWorkerPoolConfig {
-    pub max_count: Option<u16>,
-    pub idle_timeout: Option<Duration>,
-    pub max_count_per_key: Option<u16>,
-}
+let keyed_config = KeyedWorkerPoolConfig::default()
+    .with_max_count(Some(16))
+    .with_max_idle_count(Some(8))
+    .with_idle_timeout(Some(Duration::from_secs(60)))
+    .with_max_count_per_key(Some(4))
+    .with_max_idle_count_per_key(Some(2));
+
+let classified_config = ClassifiedWorkerPoolConfig::default()
+    .with_max_count(Some(16))
+    .with_max_idle_count(Some(8))
+    .with_idle_timeout(Some(Duration::from_secs(60)))
+    .with_max_count_per_classification(Some(4))
+    .with_max_idle_count_per_classification(Some(2));
 ```
 
 其中：
 
-- 两个配置的 `max_count` 缺省为 `None`，表示不限制池总量；`Some(0)` 是无效配置；
+- 所有配置项缺省为 `None`；
+- `max_count` 表示池总量上限；普通池严格遵守该上限，键池和分类池在为缺失的 key/classification 创建 worker 时允许临时突破该目标值；`Some(0)` 是无效配置；
 - `KeyedWorkerPoolConfig::max_count_per_key` 缺省为 `None`，表示不限制单个主键的 worker 数量；
-- `Some(count)` 表示每个主键最多保留 `count` 个已创建或正在创建的 worker，`Some(0)` 是无效配置；
+- `ClassifiedWorkerPoolConfig::max_count_per_classification` 缺省为 `None`，表示不限制单个主分类的 worker 数量；
+- 分组总量上限统计已创建和正在创建的 worker，`Some(0)` 是无效配置；
+- `max_idle_count` 只限制全池 idle worker 数量，不统计借出中或正在创建的 worker；
+- `max_idle_count_per_key` 和 `max_idle_count_per_classification` 分别限制单个主键、主分类的 idle worker 数量；
+- idle 上限为 `Some(0)` 时禁用对应范围的 idle 缓存，但不阻止创建或借出 worker；
 - `idle_timeout` 为 `None` 表示禁用 idle worker 超时释放，保持当前行为；
 - `idle_timeout` 为 `Some(duration)` 表示 idle worker 超过该时间后可被释放。
+
+worker 归还时优先直接交付给兼容等待者。没有兼容等待者时，worker 进入空闲队列尾部成为 MRU；键池和分类池先淘汰同 key/classification 下最旧的超限 idle worker，再按全池上限从队列头部淘汰 LRU。淘汰必须同步递减 `current_count` 和对应分组计数，worker 的析构必须发生在状态锁之外。
 
 普通池已经把空闲队列元素从 `W` 调整为带时间戳的结构：
 
@@ -438,10 +453,10 @@ struct IdleWorker<W> {
 }
 ```
 
-键池同样保存 idle 时间戳，并且释放 idle worker 时同步更新键计数：
+键池和分类池同样保存 idle 时间戳，并且释放 idle worker 时同步更新对应分组计数：
 
 - `current_count -= 1`
-- `worker_count_by_key` 中对应 `worker.primary_key()` 的计数减一
+- 键池的 `worker_count_by_key` 或分类池的 `classified_count_map` 中对应计数减一
 
 必须保持的计数不变量是：
 

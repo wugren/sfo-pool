@@ -34,12 +34,46 @@ pub(crate) fn pool_invalid_config_error(message: &str) -> PoolError {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Configuration for [`WorkerPool`].
+///
+/// All limits default to `None`. Use the `with_*` methods to configure the pool.
 pub struct WorkerPoolConfig {
-    /// Maximum number of workers managed by the pool.
+    /// Maximum total number of active, idle, and pending workers.
     ///
     /// `None` leaves the worker count unlimited.
-    pub max_count: Option<u16>,
-    pub idle_timeout: Option<Duration>,
+    max_count: Option<u16>,
+    /// Maximum number of idle workers retained by the pool.
+    ///
+    /// This does not limit active or pending workers. `None` adds no separate
+    /// idle limit, while `Some(0)` disables idle caching.
+    max_idle_count: Option<u16>,
+    idle_timeout: Option<Duration>,
+}
+
+impl WorkerPoolConfig {
+    /// Sets the maximum total number of workers managed by the pool.
+    ///
+    /// `None` leaves the count unlimited. `Some(0)` is invalid.
+    pub fn with_max_count(mut self, max_count: Option<u16>) -> Self {
+        self.max_count = max_count;
+        self
+    }
+
+    /// Sets the independent idle-worker cache limit.
+    ///
+    /// `None` adds no idle limit. `Some(0)` disables idle caching.
+    pub fn with_max_idle_count(mut self, max_idle_count: Option<u16>) -> Self {
+        self.max_idle_count = max_idle_count;
+        self
+    }
+
+    /// Sets the maximum duration for which an idle worker is retained.
+    ///
+    /// `None` disables timeout-based cleanup.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -386,6 +420,7 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         }
 
         let mut clear_waiters = Vec::new();
+        let mut removed_workers = Vec::new();
         let action = {
             let mut state = self.state.lock().unwrap();
             if state.clearing {
@@ -401,6 +436,13 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                         worker: work,
                         idle_since: Instant::now(),
                     });
+                    if let Some(max_idle_count) = self.config.max_idle_count {
+                        while state.worker_list.len() > usize::from(max_idle_count) {
+                            let idle_worker = state.worker_list.pop_front().unwrap();
+                            state.current_count -= 1;
+                            removed_workers.push(idle_worker.worker);
+                        }
+                    }
                     ReleaseAction::None
                 }
             } else {
@@ -418,6 +460,7 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
         for waiter in clear_waiters {
             waiter.notify(());
         }
+        drop(removed_workers);
 
         match action {
             ReleaseAction::None => {}
@@ -428,6 +471,90 @@ impl<W: Worker, F: WorkerFactory<W>> WorkerPool<W, F> {
                 Self::notify_retry_waiters(waiters);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_limit_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestWorker {
+        id: usize,
+        dropped: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Worker for TestWorker {
+        fn is_work(&self) -> bool {
+            true
+        }
+    }
+
+    impl Drop for TestWorker {
+        fn drop(&mut self) {
+            self.dropped.lock().unwrap().push(self.id);
+        }
+    }
+
+    struct TestFactory {
+        next_id: AtomicUsize,
+        dropped: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerFactory<TestWorker> for TestFactory {
+        async fn create(&self) -> PoolResult<TestWorker> {
+            Ok(TestWorker {
+                id: self.next_id.fetch_add(1, Ordering::SeqCst),
+                dropped: self.dropped.clone(),
+            })
+        }
+    }
+
+    fn new_pool(max_count: u16, max_idle_count: u16) -> WorkerPoolRef<TestWorker, TestFactory> {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        WorkerPool::new_with_config(
+            TestFactory {
+                next_id: AtomicUsize::new(0),
+                dropped,
+            },
+            WorkerPoolConfig {
+                max_count: Some(max_count),
+                max_idle_count: Some(max_idle_count),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn idle_limit_only_caps_idle_workers_and_evicts_lru() {
+        let pool = new_pool(3, 1);
+        let worker0 = pool.get_worker().await.unwrap();
+        let worker1 = pool.get_worker().await.unwrap();
+        let worker2 = pool.get_worker().await.unwrap();
+        assert_eq!(worker2.id, 2);
+
+        drop(worker0);
+        drop(worker1);
+        drop(worker2);
+        assert_eq!(*pool.factory.dropped.lock().unwrap(), vec![0, 1]);
+
+        let newest = pool.get_worker().await.unwrap();
+        assert_eq!(newest.id, 2);
+        let newly_created = pool.get_worker().await.unwrap();
+        assert_eq!(newly_created.id, 3);
+    }
+
+    #[tokio::test]
+    async fn zero_idle_limit_disables_idle_cache() {
+        let pool = new_pool(2, 0);
+        let worker = pool.get_worker().await.unwrap();
+        assert_eq!(worker.id, 0);
+        drop(worker);
+        assert_eq!(*pool.factory.dropped.lock().unwrap(), vec![0]);
+
+        let worker = pool.get_worker().await.unwrap();
+        assert_eq!(worker.id, 1);
     }
 }
 
@@ -619,7 +746,21 @@ async fn test_zero_max_count_returns_error() {
 
 #[test]
 fn test_worker_pool_config_default_max_count() {
-    assert_eq!(WorkerPoolConfig::default().max_count, None);
+    let config = WorkerPoolConfig::default();
+    assert_eq!(config.max_count, None);
+    assert_eq!(config.max_idle_count, None);
+}
+
+#[test]
+fn test_worker_pool_config_builder() {
+    let timeout = Duration::from_secs(1);
+    let config = WorkerPoolConfig::default()
+        .with_max_count(Some(2))
+        .with_max_idle_count(Some(1))
+        .with_idle_timeout(Some(timeout));
+    assert_eq!(config.max_count, Some(2));
+    assert_eq!(config.max_idle_count, Some(1));
+    assert_eq!(config.idle_timeout, Some(timeout));
 }
 
 #[tokio::test]
@@ -871,6 +1012,7 @@ async fn test_idle_worker_timeout_releases_worker() {
         WorkerPoolConfig {
             max_count: Some(1),
             idle_timeout: Some(std::time::Duration::from_millis(30)),
+            ..Default::default()
         },
     );
 
@@ -922,6 +1064,7 @@ async fn test_idle_worker_reused_before_timeout() {
         WorkerPoolConfig {
             max_count: Some(1),
             idle_timeout: Some(std::time::Duration::from_secs(1)),
+            ..Default::default()
         },
     );
 
@@ -973,6 +1116,7 @@ async fn test_cleanup_idle_worker_can_be_triggered_externally() {
         WorkerPoolConfig {
             max_count: Some(1),
             idle_timeout: Some(std::time::Duration::from_millis(30)),
+            ..Default::default()
         },
     );
 
@@ -1144,6 +1288,7 @@ async fn test_cleanup_drops_idle_worker_outside_state_lock() {
         WorkerPoolConfig {
             max_count: Some(1),
             idle_timeout: Some(Duration::ZERO),
+            ..Default::default()
         },
     );
     let (tx, rx) = mpsc::channel();
@@ -1277,6 +1422,28 @@ mod affected_drop_path_tests {
         let worker = pool.get_worker().await.unwrap();
         drop(worker);
         pool.clear_all_worker().await;
+
+        assert!(drop_result.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_idle_limit_drops_worker_outside_state_lock() {
+        let specs = Arc::new(Mutex::new(VecDeque::new()));
+        let pool = WorkerPool::new_with_config(
+            TestWorkerFactory {
+                specs: specs.clone(),
+            },
+            WorkerPoolConfig {
+                max_count: Some(1),
+                max_idle_count: Some(0),
+                ..Default::default()
+            },
+        );
+        let (spec, drop_result) = lock_check_spec(&pool, Arc::new(AtomicBool::new(true)));
+        specs.lock().unwrap().push_back(spec);
+
+        let worker = pool.get_worker().await.unwrap();
+        drop(worker);
 
         assert!(drop_result.recv_timeout(Duration::from_secs(1)).unwrap());
     }

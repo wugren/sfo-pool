@@ -13,18 +13,72 @@ pub trait WorkerKey: Send + 'static + Clone + Hash + Eq + PartialEq {}
 impl<T: Send + 'static + Clone + Hash + Eq + PartialEq> WorkerKey for T {}
 
 #[derive(Debug, Clone, Default)]
+/// Configuration for [`KeyedWorkerPool`].
+///
+/// All limits default to `None`. Use the `with_*` methods to configure the pool.
 pub struct KeyedWorkerPoolConfig {
     /// Target maximum number of workers managed by the pool.
     ///
     /// `None` leaves the worker count unlimited. A finite target may be
     /// temporarily exceeded to create a worker for a missing key.
-    pub max_count: Option<u16>,
-    pub idle_timeout: Option<Duration>,
+    max_count: Option<u16>,
+    /// Maximum number of idle workers retained across the whole pool.
+    ///
+    /// `None` adds no separate idle limit; `Some(0)` disables idle caching.
+    max_idle_count: Option<u16>,
+    idle_timeout: Option<Duration>,
     /// Maximum number of workers whose primary key is the same.
     ///
     /// `None` leaves key counts unlimited. This limit is independent
     /// of the pool-wide `max_count` target.
-    pub max_count_per_key: Option<u16>,
+    max_count_per_key: Option<u16>,
+    /// Maximum number of idle workers retained for each primary key.
+    ///
+    /// This limit is independent for every key. `None` adds no per-key idle
+    /// limit; `Some(0)` disables idle caching for every key.
+    max_idle_count_per_key: Option<u16>,
+}
+
+impl KeyedWorkerPoolConfig {
+    /// Sets the pool-wide target worker count.
+    ///
+    /// `None` leaves the count unlimited. `Some(0)` is invalid.
+    pub fn with_max_count(mut self, max_count: Option<u16>) -> Self {
+        self.max_count = max_count;
+        self
+    }
+
+    /// Sets the pool-wide idle-worker cache limit.
+    ///
+    /// `None` adds no idle limit. `Some(0)` disables idle caching.
+    pub fn with_max_idle_count(mut self, max_idle_count: Option<u16>) -> Self {
+        self.max_idle_count = max_idle_count;
+        self
+    }
+
+    /// Sets the maximum duration for which an idle worker is retained.
+    ///
+    /// `None` disables timeout-based cleanup.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Sets the worker-count limit for each primary key.
+    ///
+    /// `None` leaves per-key counts unlimited. `Some(0)` is invalid.
+    pub fn with_max_count_per_key(mut self, max_count: Option<u16>) -> Self {
+        self.max_count_per_key = max_count;
+        self
+    }
+
+    /// Sets the idle-worker cache limit for each primary key.
+    ///
+    /// `None` adds no per-key idle limit. `Some(0)` disables idle caching.
+    pub fn with_max_idle_count_per_key(mut self, max_idle_count: Option<u16>) -> Self {
+        self.max_idle_count_per_key = max_idle_count;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -254,6 +308,31 @@ pub struct KeyedWorkerPool<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactor
     state: Mutex<WorkerPoolState<K, W, F>>,
 }
 pub type KeyedWorkerPoolRef<K, W, F> = Arc<KeyedWorkerPool<K, W, F>>;
+
+#[cfg(test)]
+#[test]
+fn test_keyed_worker_pool_config_default_idle_limits() {
+    let config = KeyedWorkerPoolConfig::default();
+    assert_eq!(config.max_idle_count, None);
+    assert_eq!(config.max_idle_count_per_key, None);
+}
+
+#[cfg(test)]
+#[test]
+fn test_keyed_worker_pool_config_builder() {
+    let timeout = Duration::from_secs(1);
+    let config = KeyedWorkerPoolConfig::default()
+        .with_max_count(Some(4))
+        .with_max_idle_count(Some(3))
+        .with_idle_timeout(Some(timeout))
+        .with_max_count_per_key(Some(2))
+        .with_max_idle_count_per_key(Some(1));
+    assert_eq!(config.max_count, Some(4));
+    assert_eq!(config.max_idle_count, Some(3));
+    assert_eq!(config.idle_timeout, Some(timeout));
+    assert_eq!(config.max_count_per_key, Some(2));
+    assert_eq!(config.max_idle_count_per_key, Some(1));
+}
 
 impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPool<K, W, F> {
     fn key_limit_reached(&self, state: &WorkerPoolState<K, W, F>, key: &K) -> bool {
@@ -536,6 +615,7 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
         let primary_key_valid =
             work.primary_key() == primary_key && work.supports(primary_key.clone());
         let mut clear_waiters = Vec::new();
+        let mut removed_workers = Vec::new();
         let action = {
             let mut state = self.state.lock().unwrap();
             state.remove_canceled_waiters();
@@ -581,9 +661,36 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
                 } else {
                     state.worker_list.push_back(IdleWorker {
                         worker: work,
-                        primary_key,
+                        primary_key: primary_key.clone(),
                         idle_since: Instant::now(),
                     });
+                    if let Some(max_idle_count_per_key) = self.config.max_idle_count_per_key {
+                        while state
+                            .worker_list
+                            .iter()
+                            .filter(|idle_worker| idle_worker.primary_key == primary_key)
+                            .count()
+                            > usize::from(max_idle_count_per_key)
+                        {
+                            let index = state
+                                .worker_list
+                                .iter()
+                                .position(|idle_worker| idle_worker.primary_key == primary_key)
+                                .unwrap();
+                            let idle_worker = state.worker_list.remove(index).unwrap();
+                            state.current_count -= 1;
+                            state.dec_worker_count_for_key(idle_worker.primary_key.clone());
+                            removed_workers.push(idle_worker);
+                        }
+                    }
+                    if let Some(max_idle_count) = self.config.max_idle_count {
+                        while state.worker_list.len() > usize::from(max_idle_count) {
+                            let idle_worker = state.worker_list.pop_front().unwrap();
+                            state.current_count -= 1;
+                            state.dec_worker_count_for_key(idle_worker.primary_key.clone());
+                            removed_workers.push(idle_worker);
+                        }
+                    }
                     ReleaseAction::None
                 }
             } else {
@@ -602,6 +709,7 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
         for waiter in clear_waiters {
             waiter.notify(());
         }
+        drop(removed_workers);
 
         match action {
             ReleaseAction::None => {}
@@ -612,6 +720,105 @@ impl<K: WorkerKey, W: KeyedWorker<K>, F: KeyedWorkerFactory<K, W>> KeyedWorkerPo
                 Self::notify_retry_waiters(waiters);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_limit_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    enum Key {
+        A,
+        B,
+    }
+
+    struct TestWorker {
+        id: usize,
+        key: Key,
+    }
+
+    impl KeyedWorker<Key> for TestWorker {
+        fn is_work(&self) -> bool {
+            true
+        }
+
+        fn supports(&self, key: Key) -> bool {
+            self.key == key
+        }
+
+        fn primary_key(&self) -> Key {
+            self.key.clone()
+        }
+    }
+
+    struct TestFactory(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl KeyedWorkerFactory<Key, TestWorker> for TestFactory {
+        async fn create(&self, key: Key) -> PoolResult<TestWorker> {
+            Ok(TestWorker {
+                id: self.0.fetch_add(1, Ordering::SeqCst),
+                key,
+            })
+        }
+    }
+
+    fn new_pool(
+        global_idle: u16,
+        per_key_idle: u16,
+    ) -> KeyedWorkerPoolRef<Key, TestWorker, TestFactory> {
+        KeyedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            KeyedWorkerPoolConfig {
+                max_count: Some(3),
+                max_idle_count: Some(global_idle),
+                max_count_per_key: None,
+                max_idle_count_per_key: Some(per_key_idle),
+                idle_timeout: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn per_key_idle_limits_are_isolated_and_evict_key_lru() {
+        let pool = new_pool(2, 1);
+        let a0 = pool.get_worker(Key::A).await.unwrap();
+        let a1 = pool.get_worker(Key::A).await.unwrap();
+        let b2 = pool.get_worker(Key::B).await.unwrap();
+        drop(a0);
+        drop(b2);
+        drop(a1);
+
+        let a = pool.get_worker(Key::A).await.unwrap();
+        let b = pool.get_worker(Key::B).await.unwrap();
+        assert_eq!(a.id, 1);
+        assert_eq!(b.id, 2);
+    }
+
+    #[tokio::test]
+    async fn global_idle_limit_evicts_pool_lru_after_per_key_limit() {
+        let pool = new_pool(1, 2);
+        let a = pool.get_worker(Key::A).await.unwrap();
+        let b = pool.get_worker(Key::B).await.unwrap();
+        drop(a);
+        drop(b);
+
+        let b = pool.get_worker(Key::B).await.unwrap();
+        assert_eq!(b.id, 1);
+        let a = pool.get_worker(Key::A).await.unwrap();
+        assert_eq!(a.id, 2);
+    }
+
+    #[tokio::test]
+    async fn zero_per_key_idle_limit_disables_idle_cache() {
+        let pool = new_pool(3, 0);
+        let a = pool.get_worker(Key::A).await.unwrap();
+        assert_eq!(a.id, 0);
+        drop(a);
+        let a = pool.get_worker(Key::A).await.unwrap();
+        assert_eq!(a.id, 1);
     }
 }
 
@@ -1918,6 +2125,7 @@ async fn test_mutating_worker_key_removes_returned_worker() {
             max_count: Some(1),
             idle_timeout: None,
             max_count_per_key: Some(1),
+            ..Default::default()
         },
     );
     let mut worker = pool.get_worker(TestWorkerKey::A).await.unwrap();
@@ -2148,6 +2356,7 @@ mod affected_path_tests {
 
     fn new_drop_probe_pool(
         idle_timeout: Option<Duration>,
+        max_idle_count: Option<u16>,
     ) -> (DropProbePool, Arc<Mutex<VecDeque<DropProbeSpec>>>) {
         let specs = Arc::new(Mutex::new(VecDeque::new()));
         let pool = KeyedWorkerPool::new(
@@ -2156,6 +2365,7 @@ mod affected_path_tests {
             },
             KeyedWorkerPoolConfig {
                 max_count: Some(1),
+                max_idle_count,
                 idle_timeout,
                 ..Default::default()
             },
@@ -2192,6 +2402,7 @@ mod affected_path_tests {
     #[derive(Copy, Clone)]
     enum IdleDropPath {
         Cleanup,
+        IdleLimit,
         KeyedInvalidScan,
         KeyedReplacement,
         Clear,
@@ -2199,7 +2410,8 @@ mod affected_path_tests {
 
     async fn assert_idle_drop_path_runs_outside_lock(path: IdleDropPath) {
         let idle_timeout = matches!(path, IdleDropPath::Cleanup).then_some(Duration::ZERO);
-        let (pool, specs) = new_drop_probe_pool(idle_timeout);
+        let max_idle_count = matches!(path, IdleDropPath::IdleLimit).then_some(0);
+        let (pool, specs) = new_drop_probe_pool(idle_timeout, max_idle_count);
         let working = Arc::new(AtomicBool::new(true));
         let (spec, drop_result) = drop_lock_probe(&pool, working.clone());
         specs.lock().unwrap().push_back(spec);
@@ -2210,6 +2422,9 @@ mod affected_path_tests {
         match path {
             IdleDropPath::Cleanup => {
                 assert_eq!(pool.cleanup_idle_worker(), 1);
+            }
+            IdleDropPath::IdleLimit => {
+                // The first return above evicts immediately from the zero-cap pool.
             }
             IdleDropPath::KeyedInvalidScan => {
                 working.store(false, Ordering::SeqCst);
@@ -2232,6 +2447,7 @@ mod affected_path_tests {
     async fn test_all_keyed_idle_drop_paths_run_outside_state_lock() {
         for path in [
             IdleDropPath::Cleanup,
+            IdleDropPath::IdleLimit,
             IdleDropPath::KeyedInvalidScan,
             IdleDropPath::KeyedReplacement,
             IdleDropPath::Clear,
@@ -2294,6 +2510,7 @@ mod affected_path_tests {
                 max_count: Some(max_count),
                 idle_timeout: None,
                 max_count_per_key: Some(max_count_per_key),
+                ..Default::default()
             },
         )
     }

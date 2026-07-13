@@ -90,10 +90,10 @@ use std::time::Duration;
 # }
 let pool = WorkerPool::new_with_config(
     ConnectionFactory,
-    WorkerPoolConfig {
-        max_count: Some(8),
-        idle_timeout: Some(Duration::from_secs(60)),
-    },
+    WorkerPoolConfig::default()
+        .with_max_count(Some(8))
+        .with_max_idle_count(Some(4))
+        .with_idle_timeout(Some(Duration::from_secs(60))),
 );
 
 // 空闲 worker 会在下次获取前被懒惰清理，也可以主动触发清理。
@@ -101,7 +101,7 @@ let removed_count = pool.cleanup_idle_worker();
 # let _ = removed_count;
 ```
 
-`max_count: None` 表示不限制 worker 数量。`max_count: Some(0)` 是无效配置，获取 worker 时会返回 `PoolErrorCode::InvalidConfig`。
+`max_count` 限制活动、空闲和正在创建的 worker 总数；`None` 表示总数不受限，`Some(0)` 是无效配置。`max_idle_count` 只独立限制空闲 LRU 缓存；`None` 保持旧行为，`Some(0)` 禁用空闲缓存。即使空闲缓存已满，只要总容量允许，仍可创建新的活动 worker。配置字段为私有字段，请通过 `Default` 和 `with_*` 方法构造配置。
 
 ## 键 worker 池
 
@@ -155,11 +155,11 @@ impl KeyedWorkerFactory<Region, RegionalConnection> for RegionalConnectionFactor
 async fn main() -> PoolResult<()> {
     let pool = KeyedWorkerPool::new(
         RegionalConnectionFactory,
-        KeyedWorkerPoolConfig {
-            max_count: Some(16),
-            max_count_per_key: Some(4),
-            idle_timeout: None,
-        },
+        KeyedWorkerPoolConfig::default()
+            .with_max_count(Some(16))
+            .with_max_idle_count(Some(8))
+            .with_max_count_per_key(Some(4))
+            .with_max_idle_count_per_key(Some(2)),
     );
 
     let connection = pool.get_worker(Region::East).await?;
@@ -181,6 +181,8 @@ async fn main() -> PoolResult<()> {
 `KeyedWorkerPoolConfig::max_count` 是目标上限，而不是严格上限。当池已满、没有可替换的空闲 worker，并且请求的键当前没有已创建或正在创建的 worker 时，池可以临时超过该值创建 worker。多余 worker 会在归还且没有等待者需要时被移除。
 
 `max_count_per_key` 是独立的单个键硬限制；达到限制后，同键的新请求会等待已有 worker。两个上限均可设为 `None`，表示不限制。设为 `Some(0)` 时，相关请求会返回无效配置错误。
+
+`max_idle_count` 是全池空闲 LRU 缓存上限，`max_idle_count_per_key` 是每个主键相互独立的空闲缓存上限；两者都不统计已借出或正在创建的 worker。归还时会优先直接交付给兼容 waiter，否则插入为 MRU；超限时先淘汰该 key 最旧的空闲 worker，再按需淘汰全池 LRU。两个字段默认都是 `None`，零值禁用对应空闲缓存。所有配置值均通过 `with_*` 构建方法设置。
 
 ## 清理与错误
 

@@ -13,18 +13,72 @@ pub trait WorkerClassification: Send + 'static + Clone + Hash + Eq + PartialEq {
 impl<T: Send + 'static + Clone + Hash + Eq + PartialEq> WorkerClassification for T {}
 
 #[derive(Debug, Clone, Default)]
+/// Configuration for [`ClassifiedWorkerPool`].
+///
+/// All limits default to `None`. Use the `with_*` methods to configure the pool.
 pub struct ClassifiedWorkerPoolConfig {
     /// Target maximum number of workers managed by the pool.
     ///
     /// `None` leaves the worker count unlimited. A finite target may be
     /// temporarily exceeded to create a worker for a missing classification.
-    pub max_count: Option<u16>,
-    pub idle_timeout: Option<Duration>,
+    max_count: Option<u16>,
+    /// Maximum number of idle workers retained across the whole pool.
+    ///
+    /// `None` adds no separate idle limit; `Some(0)` disables idle caching.
+    max_idle_count: Option<u16>,
+    idle_timeout: Option<Duration>,
     /// Maximum number of workers whose primary classification is the same.
     ///
     /// `None` leaves classification counts unlimited. This limit is independent
     /// of the pool-wide `max_count` target.
-    pub max_count_per_classification: Option<u16>,
+    max_count_per_classification: Option<u16>,
+    /// Maximum number of idle workers retained for each primary classification.
+    ///
+    /// This limit is independent for every classification. `None` adds no
+    /// per-classification idle limit; `Some(0)` disables idle caching.
+    max_idle_count_per_classification: Option<u16>,
+}
+
+impl ClassifiedWorkerPoolConfig {
+    /// Sets the pool-wide target worker count.
+    ///
+    /// `None` leaves the count unlimited. `Some(0)` is invalid.
+    pub fn with_max_count(mut self, max_count: Option<u16>) -> Self {
+        self.max_count = max_count;
+        self
+    }
+
+    /// Sets the pool-wide idle-worker cache limit.
+    ///
+    /// `None` adds no idle limit. `Some(0)` disables idle caching.
+    pub fn with_max_idle_count(mut self, max_idle_count: Option<u16>) -> Self {
+        self.max_idle_count = max_idle_count;
+        self
+    }
+
+    /// Sets the maximum duration for which an idle worker is retained.
+    ///
+    /// `None` disables timeout-based cleanup.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Sets the worker-count limit for each primary classification.
+    ///
+    /// `None` leaves per-classification counts unlimited. `Some(0)` is invalid.
+    pub fn with_max_count_per_classification(mut self, max_count: Option<u16>) -> Self {
+        self.max_count_per_classification = max_count;
+        self
+    }
+
+    /// Sets the idle-worker cache limit for each primary classification.
+    ///
+    /// `None` adds no per-classification idle limit. `Some(0)` disables idle caching.
+    pub fn with_max_idle_count_per_classification(mut self, max_idle_count: Option<u16>) -> Self {
+        self.max_idle_count_per_classification = max_idle_count;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -311,6 +365,31 @@ pub struct ClassifiedWorkerPool<
     state: Mutex<WorkerPoolState<C, W, F>>,
 }
 pub type ClassifiedWorkerPoolRef<C, W, F> = Arc<ClassifiedWorkerPool<C, W, F>>;
+
+#[cfg(test)]
+#[test]
+fn test_classified_worker_pool_config_default_idle_limits() {
+    let config = ClassifiedWorkerPoolConfig::default();
+    assert_eq!(config.max_idle_count, None);
+    assert_eq!(config.max_idle_count_per_classification, None);
+}
+
+#[cfg(test)]
+#[test]
+fn test_classified_worker_pool_config_builder() {
+    let timeout = Duration::from_secs(1);
+    let config = ClassifiedWorkerPoolConfig::default()
+        .with_max_count(Some(4))
+        .with_max_idle_count(Some(3))
+        .with_idle_timeout(Some(timeout))
+        .with_max_count_per_classification(Some(2))
+        .with_max_idle_count_per_classification(Some(1));
+    assert_eq!(config.max_count, Some(4));
+    assert_eq!(config.max_idle_count, Some(3));
+    assert_eq!(config.idle_timeout, Some(timeout));
+    assert_eq!(config.max_count_per_classification, Some(2));
+    assert_eq!(config.max_idle_count_per_classification, Some(1));
+}
 
 impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory<C, W>>
     ClassifiedWorkerPool<C, W, F>
@@ -750,6 +829,7 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
         let primary_classification_valid = work.classification() == primary_classification
             && work.is_valid(primary_classification.clone());
         let mut clear_waiters = Vec::new();
+        let mut removed_workers = Vec::new();
         let action = {
             let mut state = self.state.lock().unwrap();
             state.remove_canceled_waiters();
@@ -795,9 +875,42 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
                 } else {
                     state.worker_list.push_back(IdleWorker {
                         worker: work,
-                        primary_classification,
+                        primary_classification: primary_classification.clone(),
                         idle_since: Instant::now(),
                     });
+                    if let Some(max_idle_count_per_classification) =
+                        self.config.max_idle_count_per_classification
+                    {
+                        while state
+                            .worker_list
+                            .iter()
+                            .filter(|idle_worker| {
+                                idle_worker.primary_classification == primary_classification
+                            })
+                            .count()
+                            > usize::from(max_idle_count_per_classification)
+                        {
+                            let index = state
+                                .worker_list
+                                .iter()
+                                .position(|idle_worker| {
+                                    idle_worker.primary_classification == primary_classification
+                                })
+                                .unwrap();
+                            let idle_worker = state.worker_list.remove(index).unwrap();
+                            state.current_count -= 1;
+                            state.dec_classified_count(idle_worker.primary_classification.clone());
+                            removed_workers.push(idle_worker);
+                        }
+                    }
+                    if let Some(max_idle_count) = self.config.max_idle_count {
+                        while state.worker_list.len() > usize::from(max_idle_count) {
+                            let idle_worker = state.worker_list.pop_front().unwrap();
+                            state.current_count -= 1;
+                            state.dec_classified_count(idle_worker.primary_classification.clone());
+                            removed_workers.push(idle_worker);
+                        }
+                    }
                     ReleaseAction::None
                 }
             } else {
@@ -816,6 +929,7 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
         for waiter in clear_waiters {
             waiter.notify(());
         }
+        drop(removed_workers);
 
         match action {
             ReleaseAction::None => {}
@@ -826,6 +940,91 @@ impl<C: WorkerClassification, W: ClassifiedWorker<C>, F: ClassifiedWorkerFactory
                 Self::notify_retry_waiters(waiters);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_limit_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    enum Classification {
+        A,
+        B,
+    }
+
+    struct TestWorker {
+        id: usize,
+        classification: Classification,
+    }
+
+    impl ClassifiedWorker<Classification> for TestWorker {
+        fn is_work(&self) -> bool {
+            true
+        }
+
+        fn is_valid(&self, classification: Classification) -> bool {
+            self.classification == classification
+        }
+
+        fn classification(&self) -> Classification {
+            self.classification.clone()
+        }
+    }
+
+    struct TestFactory(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl ClassifiedWorkerFactory<Classification, TestWorker> for TestFactory {
+        async fn create(&self, classification: Option<Classification>) -> PoolResult<TestWorker> {
+            Ok(TestWorker {
+                id: self.0.fetch_add(1, Ordering::SeqCst),
+                classification: classification.unwrap_or(Classification::A),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn classification_and_global_idle_limits_preserve_mru_workers() {
+        let pool = ClassifiedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            ClassifiedWorkerPoolConfig {
+                max_count: Some(3),
+                max_idle_count: Some(2),
+                idle_timeout: None,
+                max_count_per_classification: None,
+                max_idle_count_per_classification: Some(1),
+            },
+        );
+        let a0 = pool.get_classified_worker(Classification::A).await.unwrap();
+        let a1 = pool.get_classified_worker(Classification::A).await.unwrap();
+        let b2 = pool.get_classified_worker(Classification::B).await.unwrap();
+        drop(a0);
+        drop(b2);
+        drop(a1);
+
+        let a = pool.get_classified_worker(Classification::A).await.unwrap();
+        let b = pool.get_classified_worker(Classification::B).await.unwrap();
+        assert_eq!(a.id, 1);
+        assert_eq!(b.id, 2);
+    }
+
+    #[tokio::test]
+    async fn zero_per_classification_idle_limit_disables_idle_cache() {
+        let pool = ClassifiedWorkerPool::new(
+            TestFactory(AtomicUsize::new(0)),
+            ClassifiedWorkerPoolConfig {
+                max_count: Some(2),
+                max_idle_count_per_classification: Some(0),
+                ..Default::default()
+            },
+        );
+        let a = pool.get_classified_worker(Classification::A).await.unwrap();
+        assert_eq!(a.id, 0);
+        drop(a);
+        let a = pool.get_classified_worker(Classification::A).await.unwrap();
+        assert_eq!(a.id, 1);
     }
 }
 
@@ -2401,6 +2600,7 @@ async fn test_mutating_worker_classification_removes_returned_worker() {
             max_count: None,
             idle_timeout: None,
             max_count_per_classification: Some(1),
+            ..Default::default()
         },
     );
     let mut worker = pool
@@ -2651,6 +2851,7 @@ mod affected_path_tests {
 
     fn new_drop_probe_pool(
         idle_timeout: Option<Duration>,
+        max_idle_count: Option<u16>,
     ) -> (DropProbePool, Arc<Mutex<VecDeque<DropProbeSpec>>>) {
         let specs = Arc::new(Mutex::new(VecDeque::new()));
         let pool = new_classified_worker_pool(
@@ -2659,6 +2860,7 @@ mod affected_path_tests {
                 specs: specs.clone(),
             },
             ClassifiedWorkerPoolConfig {
+                max_idle_count,
                 idle_timeout,
                 ..Default::default()
             },
@@ -2695,6 +2897,7 @@ mod affected_path_tests {
     #[derive(Copy, Clone)]
     enum IdleDropPath {
         Cleanup,
+        IdleLimit,
         GenericInvalidScan,
         ClassifiedInvalidScan,
         ClassifiedReplacement,
@@ -2703,7 +2906,8 @@ mod affected_path_tests {
 
     async fn assert_idle_drop_path_runs_outside_lock(path: IdleDropPath) {
         let idle_timeout = matches!(path, IdleDropPath::Cleanup).then_some(Duration::ZERO);
-        let (pool, specs) = new_drop_probe_pool(idle_timeout);
+        let max_idle_count = matches!(path, IdleDropPath::IdleLimit).then_some(0);
+        let (pool, specs) = new_drop_probe_pool(idle_timeout, max_idle_count);
         let working = Arc::new(AtomicBool::new(true));
         let (spec, drop_result) = drop_lock_probe(&pool, working.clone());
         specs.lock().unwrap().push_back(spec);
@@ -2714,6 +2918,9 @@ mod affected_path_tests {
         match path {
             IdleDropPath::Cleanup => {
                 assert_eq!(pool.cleanup_idle_worker(), 1);
+            }
+            IdleDropPath::IdleLimit => {
+                // The first return above evicts immediately from the zero-cap pool.
             }
             IdleDropPath::GenericInvalidScan => {
                 working.store(false, Ordering::SeqCst);
@@ -2742,6 +2949,7 @@ mod affected_path_tests {
     async fn test_all_classified_idle_drop_paths_run_outside_state_lock() {
         for path in [
             IdleDropPath::Cleanup,
+            IdleDropPath::IdleLimit,
             IdleDropPath::GenericInvalidScan,
             IdleDropPath::ClassifiedInvalidScan,
             IdleDropPath::ClassifiedReplacement,
@@ -2809,6 +3017,7 @@ mod affected_path_tests {
                 max_count: None,
                 idle_timeout: None,
                 max_count_per_classification: Some(max_count_per_classification),
+                ..Default::default()
             },
         )
     }

@@ -90,10 +90,10 @@ use std::time::Duration;
 # }
 let pool = WorkerPool::new_with_config(
     ConnectionFactory,
-    WorkerPoolConfig {
-        max_count: Some(8),
-        idle_timeout: Some(Duration::from_secs(60)),
-    },
+    WorkerPoolConfig::default()
+        .with_max_count(Some(8))
+        .with_max_idle_count(Some(4))
+        .with_idle_timeout(Some(Duration::from_secs(60))),
 );
 
 // Idle workers are cleaned up lazily before the next acquisition, or explicitly.
@@ -101,7 +101,7 @@ let removed_count = pool.cleanup_idle_worker();
 # let _ = removed_count;
 ```
 
-Set `max_count` to `None` for an unlimited worker count. `max_count: Some(0)` is invalid and causes worker acquisition to return `PoolErrorCode::InvalidConfig`.
+`max_count` limits the total of active, idle, and currently creating workers. Set it to `None` for an unlimited total; `Some(0)` is invalid. `max_idle_count` independently limits only the idle LRU cache. `None` preserves the previous behavior, `Some(0)` disables idle caching, and a full idle cache never prevents creating another active worker when total capacity permits. Configuration fields are private; construct values with `Default` and the `with_*` methods.
 
 ## Keyed worker pool
 
@@ -155,11 +155,11 @@ impl KeyedWorkerFactory<Region, RegionalConnection> for RegionalConnectionFactor
 async fn main() -> PoolResult<()> {
     let pool = KeyedWorkerPool::new(
         RegionalConnectionFactory,
-        KeyedWorkerPoolConfig {
-            max_count: Some(16),
-            max_count_per_key: Some(4),
-            idle_timeout: None,
-        },
+        KeyedWorkerPoolConfig::default()
+            .with_max_count(Some(16))
+            .with_max_idle_count(Some(8))
+            .with_max_count_per_key(Some(4))
+            .with_max_idle_count_per_key(Some(2)),
     );
 
     let connection = pool.get_worker(Region::East).await?;
@@ -181,6 +181,8 @@ Otherwise, acquisition returns `PoolErrorCode::InvalidConfig`. A worker's primar
 `KeyedWorkerPoolConfig::max_count` is a target rather than a strict upper bound. When the pool is full, no idle worker can be replaced, and the requested key has no existing or pending worker, the pool may temporarily exceed this value to create a worker. Excess workers are removed after they are returned and no waiter needs them.
 
 `max_count_per_key` is an independent hard limit for each key. Once the limit is reached, new requests for that key wait for an existing worker. Set either limit to `None` for no limit. Setting a relevant limit to `Some(0)` causes affected requests to return an invalid-configuration error.
+
+`max_idle_count` is the pool-wide idle LRU-cache limit, while `max_idle_count_per_key` is an independent idle-cache limit for each primary key. These limits count neither checked-out nor pending workers. On return, a worker is handed directly to a compatible waiter when possible; otherwise it becomes MRU. The pool first evicts the oldest idle worker for an over-limit key, then evicts the pool-wide LRU if needed. Both fields default to `None`; zero disables the corresponding idle cache. All configuration values are set through the `with_*` builder methods.
 
 ## Clearing and errors
 
